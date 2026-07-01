@@ -300,6 +300,72 @@ function fetchTrailer(vid) {
   return p;
 }
 
+/** Resolve the direct googlevideo URL(s) without downloading (yt-dlp -g): [video] or
+ *  [video, audio]. IP-bound URLs — only usable from THIS host, which is why we proxy. */
+function ytdlpUrls(vid) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(YTDLP, ['-q', '--no-warnings', '--cache-dir', YTDLP_CACHE,
+      '-f', YTDLP_FORMAT, '-g', `https://www.youtube.com/watch?v=${vid}`],
+      { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '', err = '';
+    proc.stdout.on('data', (d) => { out += d; });
+    proc.stderr.on('data', (d) => { err += d; });
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      const urls = out.trim().split('\n').filter(Boolean);
+      if (code === 0 && urls.length) resolve(urls);
+      else reject(classifyYtdlpError(code, err));
+    });
+  });
+}
+
+/** Remux a fragmented stream capture into a faststart MP4 for the cache, so replays/seeks use
+ *  the fast ranged path. Local copy-mux, no re-encode. */
+function remuxFaststart(src, vid) {
+  const dst = cachePath(vid);
+  const ff = spawn('ffmpeg', ['-y', '-hide_banner', '-loglevel', 'error', '-i', src,
+    '-c', 'copy', '-movflags', '+faststart', dst], { stdio: 'ignore' });
+  ff.on('close', (code) => {
+    fs.unlink(src, () => {});
+    if (code === 0) { try { evictIfNeeded(); } catch { /* ignore */ } }
+    else { fs.unlink(dst, () => {}); }
+  });
+  ff.on('error', () => fs.unlink(src, () => {}));
+}
+
+/** Stream a trailer to the client AS ffmpeg live-muxes YouTube's video+audio into fragmented
+ *  MP4 — first frame in seconds instead of after a full download. Tees to disk; on a clean
+ *  finish, remuxes to a faststart cache file for future ranged serves. Resolves once bytes are
+ *  flowing (headers sent); REJECTS before any output so the caller can fall back to buffered. */
+async function streamPlay(req, res, vid) {
+  const urls = await ytdlpUrls(vid);                 // may throw → caller falls back
+  const inputs = urls.flatMap((u) => ['-i', u]);
+  const tmp = path.join(CACHE_DIR, `.${vid}.${process.pid}.stream.mp4`);
+  const ff = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'error', ...inputs,
+    '-c', 'copy', '-movflags', 'frag_keyframe+empty_moov+default_base_moof', '-f', 'mp4', 'pipe:1'],
+    { stdio: ['ignore', 'pipe', 'pipe'] });
+  const cache = fs.createWriteStream(tmp);
+  let started = false, aborted = false;
+  const stop = () => { if (!aborted) { aborted = true; ff.kill('SIGKILL'); } };
+  req.on('close', () => { if (!res.writableEnded) stop(); });
+  res.on('error', stop);
+
+  await new Promise((resolve, reject) => {
+    ff.stdout.on('data', (chunk) => {
+      if (!started) { started = true; res.writeHead(200, { 'Content-Type': 'video/mp4', 'Cache-Control': 'no-store' }); resolve(); }
+      cache.write(chunk);
+      if (!res.write(chunk)) { ff.stdout.pause(); res.once('drain', () => ff.stdout.resume()); } // backpressure
+    });
+    ff.on('error', (e) => { if (!started) reject(e); else stop(); });
+    ff.on('close', (code) => {
+      cache.end();
+      if (!started) { fs.unlink(tmp, () => {}); reject(new Error('stream produced no output')); return; }
+      if (!res.writableEnded) res.end();
+      if (code === 0 && !aborted) remuxFaststart(tmp, vid); else fs.unlink(tmp, () => {});
+    });
+  });
+}
+
 /** Serve a file with HTTP range support (so the player can scrub). */
 function serveFile(req, res, fp) {
   const { size } = fs.statSync(fp);
@@ -341,21 +407,37 @@ async function handleRequest(req, res) {
   else if (url.pathname !== '/play') { res.writeHead(404); return res.end('not found'); }
 
   if (!vid || !VID_RE.test(vid)) { res.writeHead(400); return res.end('bad video id'); }
+
+  const fp = cachePath(vid);
+  if (fs.existsSync(fp) && fs.statSync(fp).size > 0) {           // cached → ranged serve (seeks)
+    fs.utimes(fp, new Date(), fs.statSync(fp).mtime, () => {});  // LRU bump
+    return serveFile(req, res, fp);
+  }
+  // A seek before we've cached the file can't be served from a live stream → buffer, then serve.
+  const rm = req.headers.range && /bytes=(\d+)/.exec(req.headers.range);
+  const seeking = rm && parseInt(rm[1], 10) > 0;
   try {
-    const fp = await fetchTrailer(vid);
-    serveFile(req, res, fp);
+    if (seeking) return serveFile(req, res, await fetchTrailer(vid));
+    await streamPlay(req, res, vid);          // cold play → stream as it muxes (fast first frame)
   } catch (e) {
     console.error(`[${vid}] ${e.message}`);
-    if (!res.headersSent) {
-      const body = JSON.stringify({
-        error: e.reason || 'extraction_failed',
-        message: e.userMessage || 'Could not fetch this trailer.',
-        id: vid,
-      });
-      res.writeHead(e.status || 502, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
-      res.end(body);
+    if (!res.headersSent) {                    // couldn't start streaming → buffered, else typed error
+      try { return serveFile(req, res, await fetchTrailer(vid)); }
+      catch (e2) { return playError(res, vid, e2); }
     }
   }
+}
+
+/** Typed /play failure body (geo_blocked 451 / restricted 403 / unavailable 404 / 502). */
+function playError(res, vid, e) {
+  if (res.headersSent) return;
+  const body = JSON.stringify({
+    error: e.reason || 'extraction_failed',
+    message: e.userMessage || 'Could not fetch this trailer.',
+    id: vid,
+  });
+  res.writeHead(e.status || 502, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
+  res.end(body);
 }
 
 const server = http.createServer(handleRequest);
