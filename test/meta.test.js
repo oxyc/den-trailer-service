@@ -4,8 +4,15 @@
 const { test, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 process.env.TMDB_KEY = 'test-key';
+// Isolated cache dir so the /play serve tests can seed a cached file (fetchTrailer returns it
+// without spawning yt-dlp). Must be set BEFORE requiring the server (it reads CACHE_DIR at load).
+const CACHE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'den-trailer-test-'));
+process.env.CACHE_DIR = CACHE_DIR;
 const app = require('../server.js');
 
 const realFetch = global.fetch;
@@ -118,6 +125,37 @@ test('?prewarm=0 resolves without prewarming; default prewarms', async () => {
   assert.deepEqual(warmed, [], 'prewarm should be skipped');
   await requestRes('/meta/movie/tt0111161.json');
   assert.deepEqual(warmed, ['vidKey12345'], 'default should prewarm the resolved id');
+});
+
+// --- /play serve contract: AVPlayer needs Content-Length + Accept-Ranges + 206-on-Range for a
+// progressive MP4. Seed a cached file so fetchTrailer returns it without spawning yt-dlp. ---
+function seedCache(vid, size) {
+  fs.writeFileSync(path.join(CACHE_DIR, `${vid}.mp4`), Buffer.alloc(size, 7));
+  return size;
+}
+
+test('GET /play (cached, no Range) → 200 with Content-Length + Accept-Ranges', async () => {
+  const size = seedCache('cachedVid01', 4096);
+  const r = await requestRes('/play/cachedVid01.mp4');
+  assert.equal(r.status, 200);
+  assert.equal(r.headers['content-length'], String(size));
+  assert.equal(r.headers['accept-ranges'], 'bytes');
+  assert.equal(r.headers['content-type'], 'video/mp4');
+});
+
+test('GET /play with Range → 206 + Content-Range + right length', async () => {
+  const size = seedCache('cachedVid02', 4096);
+  const r = await requestRes('/play/cachedVid02.mp4', { range: 'bytes=0-99' });
+  assert.equal(r.status, 206);
+  assert.equal(r.headers['content-range'], `bytes 0-99/${size}`);
+  assert.equal(r.headers['content-length'], '100');
+  assert.equal(r.headers['accept-ranges'], 'bytes');
+});
+
+test('GET /play with an unsatisfiable Range → 416', async () => {
+  const size = seedCache('cachedVid03', 100);
+  const r = await requestRes('/play/cachedVid03.mp4', { range: `bytes=${size + 10}-` });
+  assert.equal(r.status, 416);
 });
 
 /** Like request() but returns { status, headers, body }. */
