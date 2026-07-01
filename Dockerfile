@@ -25,7 +25,7 @@ COPY package.json server.js ./
 ENV PORT=8092 \
     CACHE_DIR=/cache \
     YTDLP_PATH=/usr/local/bin/yt-dlp \
-    MAX_HEIGHT=720
+    MAX_HEIGHT=1080
 VOLUME ["/cache"]
 EXPOSE 8092
 
