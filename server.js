@@ -28,10 +28,12 @@ const path = require('path');
 const PORT = parseInt(process.env.PORT || '8092', 10);
 const CACHE_DIR = process.env.CACHE_DIR || path.join(require('os').tmpdir(), 'den-trailer-cache');
 const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
-const MAX_HEIGHT = process.env.MAX_HEIGHT || '1080';
+const MAX_HEIGHT = process.env.MAX_HEIGHT || '720'; // avc1 most reliable ≤720; ~halves bytes vs 1080
 const CACHE_MAX_BYTES = parseInt(process.env.CACHE_MAX_BYTES || String(8 * 1024 * 1024 * 1024), 10); // 8 GB
 const VID_RE = /^[A-Za-z0-9_-]{6,15}$/;
 const MAX_PROBE = 6; // cap how many trailer candidates we validate per movie
+const PREWARM_MAX = 3; // cap concurrent prewarm downloads (bounds a burst of /meta calls)
+const YTDLP_CACHE = path.join(CACHE_DIR, 'yt-dlp'); // persist nsig/player-JS cache across restarts
 // The yt-dlp format we serve: H.264(avc1) + AAC(mp4a), ≤MAX_HEIGHT (avc1's ceiling on YT),
 // faststart-muxable. We force this so trailers play on AVPlayer's HARDWARE decode path —
 // lighter/faster than routing a short clip through the app's Aether Engine, which *can*
@@ -135,26 +137,43 @@ async function resolveYouTubeId(imdbId, type, lang) {
   const cacheKey = `${imdbId}:${lang}`;
   const hit = ytCache.get(cacheKey);
   if (hit && hit.exp > cacheClock()) return hit.id;
-  // All candidates, official trailer first; KinoCheck appended as an extra fallback source.
-  const kc = await kinoCheckYouTubeId(imdbId, type, lang);
-  const candidates = [...new Set([
-    ...(await tmdbTrailerCandidates(imdbId, type, lang)),
-    ...(kc ? [kc] : []),
-  ])];
-  let id = '';
-  for (const c of candidates.slice(0, MAX_PROBE)) {
-    if (await prober(c)) { id = c; break; }
-  }
+  // TMDB + KinoCheck concurrently (KinoCheck is only a fallback source, but fetching it in
+  // parallel costs no extra wall-clock). Official trailer first, KinoCheck appended.
+  const [tmdb, kc] = await Promise.all([
+    tmdbTrailerCandidates(imdbId, type, lang),
+    kinoCheckYouTubeId(imdbId, type, lang),
+  ]);
+  const candidates = [...new Set([...tmdb, ...(kc ? [kc] : [])])].slice(0, MAX_PROBE);
+  const id = await firstPlayable(candidates);
   ytCache.set(cacheKey, { id, exp: cacheClock() + (id ? YT_TTL_MS : YT_NEG_TTL_MS) });
+  prewarm(id); // start the download now (bounded) so Den's /play moments later hits a warm cache
   return id;
 }
+
+/** First candidate yt-dlp can actually extract here, preserving rank order. Common case (top
+ *  trailer plays) costs ONE probe; only on a miss do we probe the rest concurrently and take
+ *  the highest-ranked that passes — so a geo-blocked top pick no longer serialises N×3s. */
+async function firstPlayable(candidates) {
+  if (!candidates.length) return '';
+  if (await prober(candidates[0])) return candidates[0];
+  const rest = candidates.slice(1);
+  const probes = rest.map((c) => prober(c)); // run concurrently...
+  for (let i = 0; i < rest.length; i++) {
+    if (await probes[i]) return rest[i]; // ...but await in rank order → highest-ranked winner
+  }
+  return '';
+}
+
+// Fire-and-forget download so /play is warm. Bounded by inFlight size to survive a /meta burst;
+// inFlight dedupes the later real /play. Swapped to a no-op in tests via _setPrewarm.
+let prewarm = (id) => { if (id && inFlight.size < PREWARM_MAX) fetchTrailer(id).catch(() => {}); };
 
 /** Does yt-dlp think this id is extractable HERE (right region, decodable formats)? Fast:
  *  --simulate, no download. Swapped out in tests via _setProber. */
 function probeExtractable(ytId) {
   return new Promise((resolve) => {
-    const proc = spawn(YTDLP, ['-q', '--simulate', '--no-warnings', '-f', YTDLP_FORMAT,
-      `https://www.youtube.com/watch?v=${ytId}`], { stdio: 'ignore' });
+    const proc = spawn(YTDLP, ['-q', '--simulate', '--no-warnings', '--cache-dir', YTDLP_CACHE,
+      '-f', YTDLP_FORMAT, `https://www.youtube.com/watch?v=${ytId}`], { stdio: 'ignore' });
     proc.on('error', () => resolve(false));
     proc.on('close', (code) => resolve(code === 0));
   });
@@ -250,11 +269,14 @@ function fetchTrailer(vid) {
   const p = new Promise((resolve, reject) => {
     const args = [
       '-q', '--no-playlist', '--no-warnings',
+      '--cache-dir', YTDLP_CACHE,   // reuse the nsig/player-JS work the probe already did
+      '-N', '4',                    // parallel DASH fragments → faster download
       // AVPlayer hardware-decodable: H.264 (avc1) + AAC (mp4a) — see YTDLP_FORMAT for why.
       // Same string the resolve-time probe validates.
       '-f', YTDLP_FORMAT,
       '--merge-output-format', 'mp4',
-      '--postprocessor-args', 'ffmpeg:-movflags +faststart', // moov up front → progressive play
+      // faststart during the merge's ffmpeg (one pass), not a separate whole-file rewrite.
+      '--postprocessor-args', 'Merger+ffmpeg:-movflags +faststart',
       '-o', tmp,
       `https://www.youtube.com/watch?v=${vid}`,
     ];
@@ -349,5 +371,6 @@ module.exports = {
   pickTrailerCandidates, tmdbTrailerCandidates, kinoCheckYouTubeId, classifyYtdlpError,
   _setClock: (fn) => { cacheClock = fn; },
   _setProber: (fn) => { prober = fn; },
+  _setPrewarm: (fn) => { prewarm = fn; },
   _clearYtCache: () => ytCache.clear(),
 };

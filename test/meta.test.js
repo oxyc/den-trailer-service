@@ -9,7 +9,11 @@ process.env.TMDB_KEY = 'test-key';
 const app = require('../server.js');
 
 const realFetch = global.fetch;
-beforeEach(() => { app._clearYtCache(); app._setProber(async () => true); }); // default: every id plays
+beforeEach(() => {
+  app._clearYtCache();
+  app._setProber(async () => true); // default: every id plays
+  app._setPrewarm(() => {});         // no-op: don't spawn yt-dlp in tests
+});
 afterEach(() => { global.fetch = realFetch; app._clearYtCache(); });
 
 const jsonRes = (body, status = 200) => ({ ok: status < 400, status, json: async () => body });
