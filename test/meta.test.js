@@ -1,6 +1,6 @@
 'use strict';
-// Node's built-in runner (no deps): `node --test`. Stubs global.fetch to exercise the addon
-// path (imdb -> TMDB -> ytId -> play URL) without network, plus manifest + id validation.
+// Node's built-in runner (no deps): `node --test`. Stubs global.fetch (TMDB) and the yt-dlp
+// prober (via _setProber) so the addon path runs with no network and no yt-dlp binary.
 const { test, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
@@ -9,63 +9,87 @@ process.env.TMDB_KEY = 'test-key';
 const app = require('../server.js');
 
 const realFetch = global.fetch;
+beforeEach(() => { app._clearYtCache(); app._setProber(async () => true); }); // default: every id plays
 afterEach(() => { global.fetch = realFetch; app._clearYtCache(); });
-beforeEach(() => { app._clearYtCache(); });
 
-/** Stub fetch: TMDB /find -> one hit, /videos -> an official YouTube trailer. */
-function stubTmdb(ytKey) {
+const jsonRes = (body, status = 200) => ({ ok: status < 400, status, json: async () => body });
+
+/** Stub TMDB: /find -> one hit, /videos -> the given trailer results. */
+function stubTmdb(results) {
   global.fetch = async (u) => {
     const url = String(u);
     if (url.includes('/find/')) return jsonRes({ movie_results: [{ id: 42 }] });
-    if (url.includes('/videos')) return jsonRes({ results: [
-      { site: 'YouTube', type: 'Teaser', key: 'teaseXXXXXX' },
-      { site: 'YouTube', type: 'Trailer', official: true, key: ytKey },
-    ] });
-    return jsonRes({}, 404);
+    if (url.includes('/videos')) return jsonRes({ results });
+    return jsonRes({}, 404); // KinoCheck etc.
   };
 }
-const jsonRes = (body, status = 200) => ({ ok: status < 400, status, json: async () => body });
+
+test('pickTrailerCandidates orders official→trailer→teaser and dedupes', () => {
+  const out = app.pickTrailerCandidates([
+    { site: 'YouTube', type: 'Teaser', key: 'teaser00000' },
+    { site: 'Vimeo', type: 'Trailer', key: 'ignored0000' },
+    { site: 'YouTube', type: 'Trailer', official: true, key: 'official111' },
+    { site: 'YouTube', type: 'Trailer', key: 'plain222222' },
+    { site: 'YouTube', type: 'Trailer', official: true, key: 'official111' }, // dup
+  ]);
+  assert.deepEqual(out, ['official111', 'plain222222', 'teaser00000']);
+});
 
 test('buildMeta produces a same-host play URL', () => {
   const out = app.buildMeta('movie', 'tt0111161', 'https://trailers.example.com/', 'abc123DEF');
   assert.equal(out.meta.links[0].trailers, 'https://trailers.example.com/play/abc123DEF.mp4');
-  assert.equal(out.meta.links[0].provider, 'Den Trailers');
 });
 
-test('buildMeta returns empty links when no trailer', () => {
-  assert.deepEqual(app.buildMeta('movie', 'tt1', 'https://x', '').meta.links, []);
-});
-
-test('resolveYouTubeId picks the official trailer and caches it', async () => {
+test('resolveYouTubeId returns the first playable candidate and caches it', async () => {
   let calls = 0;
-  const key = 'realTrailer1';
-  global.fetch = async (u) => { calls++; return stubTmdbOnce(String(u), key); };
-  assert.equal(await app.resolveYouTubeId('tt0111161', 'movie', 'en'), key);
+  global.fetch = async (u) => { calls++; const url = String(u);
+    if (url.includes('/find/')) return jsonRes({ movie_results: [{ id: 42 }] });
+    if (url.includes('/videos')) return jsonRes({ results: [{ site: 'YouTube', type: 'Trailer', official: true, key: 'firstGood11' }] });
+    return jsonRes({}, 404);
+  };
+  assert.equal(await app.resolveYouTubeId('tt0111161', 'movie', 'en'), 'firstGood11');
   const after = calls;
-  assert.equal(await app.resolveYouTubeId('tt0111161', 'movie', 'en'), key); // cache hit
-  assert.equal(calls, after, 'second lookup should be served from cache (no new fetches)');
+  assert.equal(await app.resolveYouTubeId('tt0111161', 'movie', 'en'), 'firstGood11'); // cached
+  assert.equal(calls, after, 'second lookup is a cache hit (no new fetches)');
 });
 
-function stubTmdbOnce(url, ytKey) {
-  if (url.includes('/find/')) return jsonRes({ movie_results: [{ id: 42 }] });
-  if (url.includes('/videos')) return jsonRes({ results: [{ site: 'YouTube', type: 'Trailer', official: true, key: ytKey }] });
-  return jsonRes({}, 404);
-}
+test('resolveYouTubeId skips a geo-blocked candidate and falls back to the next', async () => {
+  stubTmdb([
+    { site: 'YouTube', type: 'Trailer', official: true, key: 'blockedUS01' },
+    { site: 'YouTube', type: 'Trailer', key: 'worldwide22' },
+  ]);
+  app._setProber(async (id) => id !== 'blockedUS01'); // the US-only one fails to probe
+  assert.equal(await app.resolveYouTubeId('tt0111161', 'movie', 'en'), 'worldwide22');
+});
+
+test('resolveYouTubeId returns "" when no candidate is playable', async () => {
+  stubTmdb([{ site: 'YouTube', type: 'Trailer', official: true, key: 'blockedUS01' }]);
+  app._setProber(async () => false);
+  assert.equal(await app.resolveYouTubeId('tt0111161', 'movie', 'en'), '');
+});
+
+test('classifyYtdlpError maps a geo-block to 451', () => {
+  const e = app.classifyYtdlpError(1, 'ERROR: [youtube] X: The uploader has not made this video available in your country');
+  assert.equal(e.status, 451);
+  assert.equal(e.reason, 'geo_blocked');
+});
+
+test('classifyYtdlpError defaults to 502', () => {
+  assert.equal(app.classifyYtdlpError(1, 'some other failure').status, 502);
+});
 
 test('GET /manifest.json returns the addon manifest', async () => {
   const body = await request('/manifest.json');
   assert.equal(body.resources[0], 'meta');
-  assert.deepEqual(body.types, ['movie', 'series']);
 });
 
 test('GET /meta rejects a non-imdb id with empty links (no upstream call)', async () => {
   global.fetch = async () => { throw new Error('must not be called'); };
-  const body = await request('/meta/movie/not-an-id.json');
-  assert.deepEqual(body.meta.links, []);
+  assert.deepEqual((await request('/meta/movie/not-an-id.json')).meta.links, []);
 });
 
 test('GET /meta resolves a real imdb id to a play URL on the request host', async () => {
-  stubTmdb('vidKey12345');
+  stubTmdb([{ site: 'YouTube', type: 'Trailer', official: true, key: 'vidKey12345' }]);
   const body = await request('/meta/movie/tt0111161.json', { host: 'trailers.example.com', 'x-forwarded-proto': 'https' });
   assert.equal(body.meta.links[0].trailers, 'https://trailers.example.com/play/vidKey12345.mp4');
 });

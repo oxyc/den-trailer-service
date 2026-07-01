@@ -40,7 +40,19 @@ GET /play/<youtube_id>.mp4  (or ?v=…)     →  200/206 video/mp4  (range-enabl
 GET /health                               →  200 ok
 ```
 
-The addon returns `links: []` (never an error) when there's no trailer or `TMDB_KEY` is unset.
+`/meta` returns the first **playable** trailer: it probes TMDB's candidates (official first,
+then KinoCheck) with yt-dlp and skips ones that are geo-blocked / removed / undecodable *here*,
+so the URL it hands back actually plays. `links: []` means "nothing playable in this region"
+(or no trailer, or `TMDB_KEY` unset) — never an error.
+
+`/play` failures return a real status + JSON so the caller can say *why*:
+
+```
+451 {"error":"geo_blocked","message":"This trailer is not available in your region.","id":…}
+403 {"error":"restricted", …}   # private / age-restricted
+404 {"error":"unavailable", …}  # removed
+502 {"error":"extraction_failed", …}
+```
 
 ## Run
 

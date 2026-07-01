@@ -31,6 +31,14 @@ const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
 const MAX_HEIGHT = process.env.MAX_HEIGHT || '1080';
 const CACHE_MAX_BYTES = parseInt(process.env.CACHE_MAX_BYTES || String(8 * 1024 * 1024 * 1024), 10); // 8 GB
 const VID_RE = /^[A-Za-z0-9_-]{6,15}$/;
+const MAX_PROBE = 6; // cap how many trailer candidates we validate per movie
+// The yt-dlp format we serve: H.264(avc1) + AAC(mp4a), ≤MAX_HEIGHT, faststart-muxable.
+// Shared by the extract path AND the resolve-time probe, so a probe validates exactly what
+// playback will need (a candidate that can't produce this — geo-blocked, removed, wrong
+// codecs — is skipped in favour of the next trailer).
+const YTDLP_FORMAT =
+  `bv*[height<=${MAX_HEIGHT}][vcodec^=avc1]+ba[acodec^=mp4a]/`
+  + `b[height<=${MAX_HEIGHT}][vcodec^=avc1][acodec^=mp4a]/18/b[ext=mp4]`;
 
 fs.mkdirSync(CACHE_DIR, { recursive: true });
 const inFlight = new Map(); // vid -> Promise<filepath>
@@ -55,6 +63,7 @@ const MANIFEST = {
 // Cache the STABLE ytId (the expensive lookup); playback is just our /play proxy for it.
 // In-memory (24h TTL) — cheap to rebuild on restart, no external store needed. "" = "no trailer".
 const YT_TTL_MS = 24 * 60 * 60 * 1000;
+const YT_NEG_TTL_MS = 60 * 60 * 1000; // "nothing playable" caches shorter (geo/transient may lift)
 const ytCache = new Map(); // `${imdbId}:${lang}` -> { id: string, exp: number }
 
 // Indirection so tests can hold time still without Date.now() flakiness.
@@ -65,33 +74,38 @@ async function safeJson(res) {
   try { return await res.json(); } catch { return null; }
 }
 
-/** imdb → TMDB id (via /find) → /videos → official YouTube Trailer key (or null). */
-async function tmdbTrailerYouTubeId(imdbId, type, lang) {
+/** Rank + dedupe a TMDB /videos result into an ordered list of YouTube ids
+ *  (official trailer first, then trailer, teaser, anything else). Pure — unit-tested. */
+function pickTrailerCandidates(results) {
+  const yt = (results ?? []).filter((v) => v.site === 'YouTube' && v.key);
+  const rank = (v) =>
+    v.type === 'Trailer' && v.official ? 0 :
+    v.type === 'Trailer' ? 1 :
+    v.type === 'Teaser' ? 2 : 3;
+  return [...new Set(yt.slice().sort((a, b) => rank(a) - rank(b)).map((v) => v.key))];
+}
+
+/** imdb → TMDB id (via /find) → /videos → ordered YouTube trailer candidates ([] on miss). */
+async function tmdbTrailerCandidates(imdbId, type, lang) {
   const key = process.env.TMDB_KEY;
-  if (!key) return null;
+  if (!key) return [];
   const tmdbType = type === 'series' ? 'tv' : 'movie';
   let find;
   try {
     find = await fetch(`https://api.themoviedb.org/3/find/${imdbId}?external_source=imdb_id&api_key=${key}`);
-  } catch { return null; }
-  if (!find.ok) return null;
+  } catch { return []; }
+  if (!find.ok) return [];
   const found = await safeJson(find);
   const hit = (tmdbType === 'movie' ? found?.movie_results : found?.tv_results)?.[0];
-  if (!hit) return null;
+  if (!hit) return [];
 
   let videos;
   try {
     videos = await fetch(`https://api.themoviedb.org/3/${tmdbType}/${hit.id}/videos?api_key=${key}&language=${lang}`);
-  } catch { return null; }
-  if (!videos.ok) return null;
+  } catch { return []; }
+  if (!videos.ok) return [];
   const data = await safeJson(videos);
-  const yt = (data?.results ?? []).filter((v) => v.site === 'YouTube');
-  const pick =
-    yt.find((v) => v.type === 'Trailer' && v.official) ??
-    yt.find((v) => v.type === 'Trailer') ??
-    yt.find((v) => v.type === 'Teaser') ??
-    yt[0];
-  return pick?.key ?? null;
+  return pickTrailerCandidates(data?.results);
 }
 
 /** KinoCheck discovery fallback: imdb → official trailer's YouTube id (or null). */
@@ -111,17 +125,54 @@ async function kinoCheckYouTubeId(imdbId, type, lang) {
   return data?.trailer?.youtube_video_id ?? null;
 }
 
-/** Resolve (and cache) the official-trailer ytId for an imdb id. "" means "looked up, none". */
+/** Resolve (and cache) the first PLAYABLE trailer ytId for an imdb id. Probes candidates with
+ *  yt-dlp and skips geo-blocked / removed / undecodable ones, so the URL we hand Den actually
+ *  plays here. "" = looked up, nothing playable (cached shorter, in case it's transient). */
 async function resolveYouTubeId(imdbId, type, lang) {
   const cacheKey = `${imdbId}:${lang}`;
   const hit = ytCache.get(cacheKey);
   if (hit && hit.exp > cacheClock()) return hit.id;
-  const id =
-    (await tmdbTrailerYouTubeId(imdbId, type, lang)) ??
-    (await kinoCheckYouTubeId(imdbId, type, lang)) ??
-    '';
-  ytCache.set(cacheKey, { id, exp: cacheClock() + YT_TTL_MS });
+  // All candidates, official trailer first; KinoCheck appended as an extra fallback source.
+  const kc = await kinoCheckYouTubeId(imdbId, type, lang);
+  const candidates = [...new Set([
+    ...(await tmdbTrailerCandidates(imdbId, type, lang)),
+    ...(kc ? [kc] : []),
+  ])];
+  let id = '';
+  for (const c of candidates.slice(0, MAX_PROBE)) {
+    if (await prober(c)) { id = c; break; }
+  }
+  ytCache.set(cacheKey, { id, exp: cacheClock() + (id ? YT_TTL_MS : YT_NEG_TTL_MS) });
   return id;
+}
+
+/** Does yt-dlp think this id is extractable HERE (right region, decodable formats)? Fast:
+ *  --simulate, no download. Swapped out in tests via _setProber. */
+function probeExtractable(ytId) {
+  return new Promise((resolve) => {
+    const proc = spawn(YTDLP, ['-q', '--simulate', '--no-warnings', '-f', YTDLP_FORMAT,
+      `https://www.youtube.com/watch?v=${ytId}`], { stdio: 'ignore' });
+    proc.on('error', () => resolve(false));
+    proc.on('close', (code) => resolve(code === 0));
+  });
+}
+let prober = probeExtractable;
+
+/** Map a yt-dlp failure to an HTTP status + short reason, so /play says why instead of a
+ *  blanket 502. yt-dlp puts the cause in stderr; we match the common YouTube ones. */
+function classifyYtdlpError(code, stderr) {
+  const s = (stderr || '').toLowerCase();
+  let status = 502, reason = 'extraction_failed', message = 'Could not fetch this trailer.';
+  if (/available in your (country|location)|blocked it in your country|not available from your location/.test(s)) {
+    status = 451; reason = 'geo_blocked'; message = 'This trailer is not available in your region.';
+  } else if (/private video|sign in to confirm your age|age-restricted|members-only/.test(s)) {
+    status = 403; reason = 'restricted'; message = 'This trailer is private or age-restricted.';
+  } else if (/video unavailable|has been removed|no longer available|does not exist|removed by the uploader/.test(s)) {
+    status = 404; reason = 'unavailable'; message = 'This trailer is no longer available.';
+  }
+  const e = new Error(`yt-dlp exit ${code}: ${(stderr || '').slice(-300)}`);
+  e.status = status; e.reason = reason; e.userMessage = message;
+  return e;
 }
 
 /** The base URL this server is reachable at (for building play URLs the device will fetch). */
@@ -196,12 +247,9 @@ function fetchTrailer(vid) {
   const p = new Promise((resolve, reject) => {
     const args = [
       '-q', '--no-playlist', '--no-warnings',
-      // MUST be AVPlayer-decodable: H.264 (avc1) video + AAC (mp4a) audio. YouTube's "best"
-      // is VP9/AV1 video + Opus audio, none of which Apple TV decodes — forcing avc1+mp4a
-      // keeps it a copy-mux (no transcode) and avoids the silent-Opus trap. avc1 caps at
-      // 1080p on YT, which matches our ceiling. 18 = 360p progressive h264+aac fallback.
-      '-f', `bv*[height<=${MAX_HEIGHT}][vcodec^=avc1]+ba[acodec^=mp4a]/`
-          + `b[height<=${MAX_HEIGHT}][vcodec^=avc1][acodec^=mp4a]/18/b[ext=mp4]`,
+      // MUST be AVPlayer-decodable: H.264 (avc1) + AAC (mp4a). YouTube's "best" is VP9/AV1 +
+      // Opus, none of which Apple TV decodes. Same string the resolve-time probe validates.
+      '-f', YTDLP_FORMAT,
       '--merge-output-format', 'mp4',
       '--postprocessor-args', 'ffmpeg:-movflags +faststart', // moov up front → progressive play
       '-o', tmp,
@@ -219,7 +267,7 @@ function fetchTrailer(vid) {
         resolve(fp);
       } else {
         try { fs.unlinkSync(tmp); } catch { /* ignore */ }
-        reject(new Error(`yt-dlp exit ${code}: ${err.slice(-300)}`));
+        reject(classifyYtdlpError(code, err));
       }
     });
   });
@@ -273,7 +321,15 @@ async function handleRequest(req, res) {
     serveFile(req, res, fp);
   } catch (e) {
     console.error(`[${vid}] ${e.message}`);
-    if (!res.headersSent) { res.writeHead(502); res.end('extraction failed'); }
+    if (!res.headersSent) {
+      const body = JSON.stringify({
+        error: e.reason || 'extraction_failed',
+        message: e.userMessage || 'Could not fetch this trailer.',
+        id: vid,
+      });
+      res.writeHead(e.status || 502, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
+      res.end(body);
+    }
   }
 }
 
@@ -287,6 +343,8 @@ if (require.main === module) {
 
 module.exports = {
   server, handleRequest, MANIFEST, buildMeta, resolveYouTubeId,
-  tmdbTrailerYouTubeId, kinoCheckYouTubeId,
-  _setClock: (fn) => { cacheClock = fn; }, _clearYtCache: () => ytCache.clear(),
+  pickTrailerCandidates, tmdbTrailerCandidates, kinoCheckYouTubeId, classifyYtdlpError,
+  _setClock: (fn) => { cacheClock = fn; },
+  _setProber: (fn) => { prober = fn; },
+  _clearYtCache: () => ytCache.clear(),
 };
