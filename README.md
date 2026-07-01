@@ -76,5 +76,7 @@ Tests: `npm test` (Node's built-in runner, no deps — stubs `fetch`).
 ## Maintenance
 
 YouTube changes frequently. Keep yt-dlp current — bump `YTDLP_VERSION` in the `Dockerfile`
-when extraction starts failing. That's the only upkeep. The GH Action publishes
+when extraction starts failing. The image also bundles **deno** (`DENO_VERSION`): recent
+yt-dlp needs a JS runtime to solve YouTube's signature challenge, and without it extraction
+degrades and fails intermittently. That's the whole upkeep. The GH Action publishes
 `ghcr.io/oxyc/den-trailer-service` on every push to `main` and on `v*` tags.
