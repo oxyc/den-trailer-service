@@ -20,7 +20,7 @@ pub fn manifest() -> Value {
         "description": "Direct-URL trailers (TMDB/KinoCheck → yt-dlp service) for inline playback.",
         "resources": ["meta"],
         "types": ["movie", "series"],
-        "idPrefixes": ["tt", "tmdb:"],
+        "idPrefixes": ["tt"],
         "catalogs": [],
     })
 }
@@ -43,11 +43,22 @@ fn self_base(cfg_public: Option<&str>, headers: &HeaderMap, port: u16) -> String
     let proto = hdr("x-forwarded-proto")
         .map(|p| p.split(',').next().unwrap_or("http").trim().to_string())
         .unwrap_or_else(|| "http".to_string());
+    // Only reflect a sane Host charset into the play URL we hand back (a spoofed Host would otherwise
+    // point the app at an attacker origin). PUBLIC_BASE_URL short-circuits this in prod.
     let host = hdr("x-forwarded-host")
         .or_else(|| hdr("host"))
+        .filter(|h| is_sane_host(h))
         .map(|h| h.to_string())
         .unwrap_or_else(|| format!("localhost:{port}"));
     format!("{proto}://{host}")
+}
+
+/// A hostname/authority we're willing to reflect into a returned URL: alnum + the punctuation a
+/// host+port uses. Rejects spaces, slashes, `@`, etc.
+fn is_sane_host(h: &str) -> bool {
+    !h.is_empty()
+        && h.len() <= 255
+        && h.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'_'))
 }
 
 /// Build the Fusion `meta` payload for a resolved (or missing) trailer.
