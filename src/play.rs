@@ -39,7 +39,7 @@ fn evict_if_needed(cfg: &Config) {
     let mut files: Vec<(PathBuf, u64, SystemTime)> = match std::fs::read_dir(&cfg.cache_dir) {
         Ok(rd) => rd
             .flatten()
-            .filter(|e| e.path().extension().map_or(false, |x| x == "mp4"))
+            .filter(|e| e.path().extension().is_some_and(|x| x == "mp4"))
             .filter_map(|e| {
                 let md = e.metadata().ok()?;
                 let atime = md.accessed().unwrap_or(SystemTime::UNIX_EPOCH);

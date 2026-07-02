@@ -26,7 +26,7 @@ pub fn manifest() -> Value {
 }
 
 fn is_imdb(id: &str) -> bool {
-    id.strip_prefix("tt").map_or(false, |d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+    id.strip_prefix("tt").is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// `^[a-z]{2}$` (case-insensitive), else the caller falls back to "en".
@@ -155,7 +155,7 @@ pub async fn handle_meta(
     }
     let payload = build_meta(ty, imdb, &base, &yt_id);
     // Only cache a SUCCESSFUL resolution (a real trailer). Empty results stay uncached to re-check.
-    let has_link = payload["meta"]["links"].as_array().map_or(false, |a| !a.is_empty());
+    let has_link = payload["meta"]["links"].as_array().is_some_and(|a| !a.is_empty());
     let extra: &[(&str, &str)] = if has_link {
         &[("cache-control", "public, max-age=604800")]
     } else {

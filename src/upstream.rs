@@ -33,7 +33,7 @@ fn rank(v: &Value) -> u8 {
 pub fn pick_trailer_candidates(results: &[Value]) -> Vec<String> {
     let mut yt: Vec<&Value> = results
         .iter()
-        .filter(|v| v["site"] == "YouTube" && v["key"].as_str().map_or(false, |k| !k.is_empty()))
+        .filter(|v| v["site"] == "YouTube" && v["key"].as_str().is_some_and(|k| !k.is_empty()))
         .collect();
     yt.sort_by_key(|v| rank(v)); // stable → preserves TMDB order within a rank, like JS's sort
     let mut seen = std::collections::HashSet::new();
