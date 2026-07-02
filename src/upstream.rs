@@ -1,6 +1,7 @@
 //! ADDON discovery: imdb id → ordered YouTube trailer candidates, via TMDB (primary) and KinoCheck
 //! (fallback). Behind a trait so tests can swap in a fake with no network.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -19,6 +20,10 @@ const MAX_UPSTREAM_BODY: usize = 4 * 1024 * 1024;
 pub trait Upstream: Send + Sync {
     async fn tmdb_candidates(&self, imdb: &str, ty: &str, lang: &str) -> Vec<String>;
     async fn kinocheck_youtube_id(&self, imdb: &str, ty: &str, lang: &str) -> Option<String>;
+    /// Consecutive hard upstream faults, for /health (ADDON-02). Non-HTTP upstreams report 0.
+    fn recent_failures(&self) -> u32 {
+        0
+    }
 }
 
 /// Rank a TMDB /videos entry: official trailer first, then trailer, teaser, anything else.
@@ -56,11 +61,14 @@ pub fn pick_trailer_candidates(results: &[Value]) -> Vec<String> {
 pub struct HttpUpstream {
     cfg: Arc<Config>,
     http: reqwest::Client,
+    /// Consecutive hard upstream faults (transport / 401 / 403 / 429 / 5xx) — surfaced as `degraded`
+    /// on /health (ADDON-02). A 404 "not found" is a miss, not a fault, so it doesn't count.
+    fails: AtomicU32,
 }
 
 impl HttpUpstream {
     pub fn new(cfg: Arc<Config>, http: reqwest::Client) -> HttpUpstream {
-        HttpUpstream { cfg, http }
+        HttpUpstream { cfg, http, fails: AtomicU32::new(0) }
     }
 
     async fn get_json(&self, url: &str, headers: &[(&str, &str)]) -> Option<Value> {
@@ -74,6 +82,7 @@ impl HttpUpstream {
                 // A network/DNS/TLS fault is a HARD failure (vs a 200-with-no-results miss) — log it
                 // (path only; the api_key lives in the query string and is dropped by redact()).
                 eprintln!("upstream request failed: {} ({e})", redact(url));
+                self.fails.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
         };
@@ -83,9 +92,11 @@ impl HttpUpstream {
             // (a normal "not found" for KinoCheck), so a broken TMDB_KEY isn't a silent empty result.
             if status == 401 || status == 403 || status == 429 || status.is_server_error() {
                 eprintln!("upstream {} -> {status}", redact(url));
+                self.fails.fetch_add(1, Ordering::Relaxed);
             }
             return None;
         }
+        self.fails.store(0, Ordering::Relaxed); // a successful call clears the degraded state
         // Cap the body (defense-in-depth beyond the 15s timeout): these JSON payloads are small, so a
         // multi-MB response is either broken or hostile — stop reading rather than buffer it all.
         let mut stream = res.bytes_stream();
@@ -161,5 +172,9 @@ impl Upstream for HttpUpstream {
         }
         let data = self.get_json(&url, &headers).await?;
         data["trailer"]["youtube_video_id"].as_str().map(|s| s.to_string())
+    }
+
+    fn recent_failures(&self) -> u32 {
+        self.fails.load(Ordering::Relaxed)
     }
 }

@@ -51,13 +51,25 @@ pub fn is_valid_vid(id: &str) -> bool {
         && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// Consecutive hard upstream faults before /health reports `degraded` (ADDON-02).
+const HEALTH_FAIL_THRESHOLD: u32 = 3;
+
 pub async fn handle_request(state: Arc<AppState>, req: Request<hyper::body::Incoming>) -> Response<Body> {
     let (parts, _body) = req.into_parts();
     let path = parts.uri.path();
     let query = parts.uri.query().unwrap_or("");
 
     if path == "/health" {
-        return httputil::text(StatusCode::OK, "ok");
+        // Standard Den addon health (ADDON-02): 200 for liveness, `degraded` when trailers can't work —
+        // no TMDB key configured, or the upstreams (TMDB/KinoCheck) have been failing.
+        let body = if state.cfg.tmdb_key.is_none() {
+            serde_json::json!({"status": "degraded", "reason": "tmdb_key_missing", "detail": "set TMDB_KEY to enable trailers"})
+        } else if state.upstream.recent_failures() >= HEALTH_FAIL_THRESHOLD {
+            serde_json::json!({"status": "degraded", "reason": "upstream_unavailable", "detail": "TMDB/KinoCheck have been failing"})
+        } else {
+            serde_json::json!({"status": "ok"})
+        };
+        return httputil::json(StatusCode::OK, &body, &[("cache-control", "no-store")]);
     }
     if path == "/manifest.json" {
         return httputil::json(StatusCode::OK, &addon::manifest(), &[]);
