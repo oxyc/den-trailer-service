@@ -87,39 +87,43 @@ pub async fn fetch_trailer(state: Arc<AppState>, vid: String) -> Result<PathBuf,
         }
     }
 
-    // Each created download gets a unique generation. Only the creator clears the map, and only if
-    // its own generation is still the stored one — so a late-waking waiter can't remove a *newer*
-    // request's entry (which would let two yt-dlp processes run for the same vid).
-    let mut my_gen: Option<u64> = None;
+    // Each created download gets a unique generation and a DETACHED driver task that owns it: the
+    // driver polls the download to completion and clears the map entry regardless of any requester's
+    // lifetime. So a client disconnecting mid-download can't orphan the entry (which would wedge the
+    // vid until restart) or leak the subprocess — this fn is now a pure waiter. The generation guard
+    // means the driver only ever removes its own entry.
     let shared: SharedDownload = {
         let mut map = state.in_flight.lock().unwrap();
         if let Some((_, existing)) = map.get(&vid) {
             existing.clone()
         } else {
             let gen = state.dl_gen.fetch_add(1, Ordering::Relaxed);
-            my_gen = Some(gen);
-            let st = state.clone();
-            let v = vid.clone();
-            let fut: BoxFuture<Result<PathBuf, PlayError>> =
-                Box::pin(async move { download_cached(st, v, gen).await });
+            let fut: BoxFuture<Result<PathBuf, PlayError>> = {
+                let st = state.clone();
+                let v = vid.clone();
+                Box::pin(async move { download_cached(st, v, gen).await })
+            };
             let shared = fut.shared();
             map.insert(vid.clone(), (gen, shared.clone()));
+            let driver = shared.clone();
+            let st = state.clone();
+            let v = vid.clone();
+            tokio::spawn(async move {
+                let _ = driver.await; // drive to completion even if every requester goes away
+                let mut map = st.in_flight.lock().unwrap();
+                if matches!(map.get(&v), Some((g, _)) if *g == gen) {
+                    map.remove(&v);
+                }
+            });
             shared
         }
     };
-    let result = shared.await;
-    if let Some(gen) = my_gen {
-        let mut map = state.in_flight.lock().unwrap();
-        if matches!(map.get(&vid), Some((g, _)) if *g == gen) {
-            map.remove(&vid);
-        }
-    }
-    result
+    shared.await
 }
 
-/// The actual yt-dlp download for a cold `vid`: mux to a per-generation temp file, atomically
-/// rename into place, then evict if we blew the cap. `gen` makes the temp name unique so even a
-/// de-dupe miss can't put two writers on one path.
+/// The actual yt-dlp download for a cold `vid`: mux to a per-generation temp file, bake the clap on
+/// the temp, then atomically rename into place and evict if we blew the cap. `gen` makes the temp
+/// name unique so even a de-dupe miss can't put two writers on one path. Bounded by `download_sem`.
 async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<PathBuf, PlayError> {
     let fp = cache_path(&state.cfg, &vid);
     // Temp MUST end in .mp4 — yt-dlp derives the merge output name from the extension. Leading dot
@@ -129,25 +133,32 @@ async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<
         .cache_dir
         .join(format!(".{vid}.{}.{gen}.partial.mp4", std::process::id()));
 
+    // Global cap on concurrent downloads (bounds CPU/disk/fd for a burst of distinct ids).
+    let _permit = state.download_sem.acquire().await;
+
     if let Err(e) = ytdlp::download_to(&state.cfg, &vid, &tmp).await {
         let _ = tokio::fs::remove_file(&tmp).await;
         return Err(e);
     }
-    tokio::fs::rename(&tmp, &fp).await.map_err(|e| PlayError {
-        status: 502,
-        reason: "extraction_failed".into(),
-        message: "Could not fetch this trailer.".into(),
-        detail: format!("rename {}: {e}", tmp.display()),
-    })?;
 
-    // Best-effort: detect the content rect (cached for /crop) and bake a `clap` box so the billboard
-    // AVPlayer crops baked-in letterbox with no app change. Never fails the download — a play must
-    // never break because crop detection did. Runs before we return, so the file the de-duped /play
-    // serves already carries the clap (the billboard is prewarmed, so this is off the hot path).
-    if let Some(report) = crate::crop::detect(&state.cfg, &vid, &fp).await {
-        state.crop_cache.lock().unwrap().insert(vid.clone(), report.clone());
-        crate::crop::bake_clap(&state.cfg, &fp, &report).await;
+    // Detect the content rect (cached for /crop) and bake a `clap` box — on the TEMP file, BEFORE
+    // publishing. So the file that appears at `fp` is already final and immutable: no request can
+    // serve it mid-clap-write, and a crash/kill during the bake leaves the temp (not a corrupt
+    // cached file). Best-effort — a play must never break because crop detection did.
+    if let Some(report) = crate::crop::detect(&state.cfg, &vid, &tmp).await {
+        crate::crop::cache_report(&state, &vid, report.clone());
+        crate::crop::bake_clap(&state.cfg, &tmp, &report).await;
     }
+
+    tokio::fs::rename(&tmp, &fp).await.map_err(|e| {
+        let _ = std::fs::remove_file(&tmp); // don't leak the temp on a rename failure
+        PlayError {
+            status: 502,
+            reason: "extraction_failed".into(),
+            message: "Could not fetch this trailer.".into(),
+            detail: format!("rename {}: {e}", tmp.display()),
+        }
+    })?;
 
     let cfg = state.cfg.clone();
     let _ = tokio::task::spawn_blocking(move || evict_if_needed(&cfg)).await;

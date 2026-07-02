@@ -33,10 +33,11 @@ tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io
 
 # Self-contained binary for a resource-constrained homelab. opt-level 3 (speed) — the size delta
 # over "z" is <1 MB but the serve/stream path wants the fast codegen (time-to-first-frame). Fat
-# LTO + one codegen unit + strip keep it small anyway; abort on panic drops unwind tables.
+# LTO + one codegen unit + strip keep it small anyway. panic=unwind (the default): a panic in one
+# request task then unwinds just that connection (tokio catches it) instead of aborting the whole
+# server — worth the small unwind-table cost for a long-lived service.
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
-panic = "abort"

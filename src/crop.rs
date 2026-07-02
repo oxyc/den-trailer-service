@@ -12,6 +12,7 @@
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyper::{Response, StatusCode};
 use serde::Serialize;
@@ -22,6 +23,10 @@ use crate::config::Config;
 use crate::httputil::{self, Body};
 use crate::play::fetch_trailer;
 use crate::state::AppState;
+use crate::CROP_CACHE_MAX;
+
+const DETECT_TIMEOUT_SECS: u64 = 60; // cropdetect keyframe pass; backstop a hung ffmpeg
+const BAKE_TIMEOUT_SECS: u64 = 30; // MP4Box clap write is ~instant; backstop a hang
 
 #[derive(Clone, Serialize)]
 pub struct Dim {
@@ -141,27 +146,29 @@ pub fn report_from(id: &str, src: Option<(u32, u32)>, raw: RawCrop) -> CropRepor
 /// Run cropdetect over the cached file. Keyframe-sampled (`-skip_frame nokey`) so it's a light
 /// decode-only pass, no encode. `None` if ffmpeg can't be run or emits no usable box.
 pub async fn detect(cfg: &Config, id: &str, fp: &Path) -> Option<CropReport> {
-    let out = Command::new(&cfg.ffmpeg)
-        .args([
-            "-hide_banner",
-            "-nostdin",
-            "-skip_frame",
-            "nokey", // decode only keyframes → fast, still catches held logo cards
-            "-i",
-            &fp.to_string_lossy(),
-            "-an",
-            "-vf",
-            "cropdetect=limit=24:round=2:reset=0",
-            "-f",
-            "null",
-            "-",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
+    let mut cmd = Command::new(&cfg.ffmpeg);
+    cmd.args([
+        "-hide_banner",
+        "-nostdin",
+        "-skip_frame",
+        "nokey", // decode only keyframes → fast, still catches held logo cards
+        "-i",
+        &fp.to_string_lossy(),
+        "-an",
+        "-vf",
+        "cropdetect=limit=24:round=2:reset=0",
+        "-f",
+        "null",
+        "-",
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
+    // Backstop timeout: on elapse the output future (owning the child) is dropped → kill_on_drop.
+    let out = tokio::time::timeout(Duration::from_secs(DETECT_TIMEOUT_SECS), cmd.output())
         .await
+        .ok()?
         .ok()?;
     let stderr = String::from_utf8_lossy(&out.stderr);
     let raw = parse_crop(&stderr)?;
@@ -195,21 +202,28 @@ pub async fn bake_clap(cfg: &Config, fp: &Path, report: &CropReport) -> bool {
         return false;
     };
     let spec = format!("1={w},1,{h},1,{ho},2,{vo},2");
-    let status = Command::new(&cfg.mp4box)
-        .args(["-clap", &spec, &fp.to_string_lossy()])
+    let mut cmd = Command::new(&cfg.mp4box);
+    cmd.args(["-clap", &spec, &fp.to_string_lossy()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .status()
-        .await;
-    match status {
-        Ok(s) if s.success() => true,
+        .kill_on_drop(true);
+    match tokio::time::timeout(Duration::from_secs(BAKE_TIMEOUT_SECS), cmd.status()).await {
+        Ok(Ok(s)) if s.success() => true,
         other => {
             eprintln!("bake_clap {}: {other:?}", fp.display());
             false
         }
     }
+}
+
+/// Insert a crop report into the cache, bounding growth (crop has no TTL, so cap the size).
+pub fn cache_report(state: &Arc<AppState>, id: &str, report: CropReport) {
+    let mut c = state.crop_cache.lock().unwrap();
+    if c.len() >= CROP_CACHE_MAX {
+        c.clear(); // crude but bounded; entries are cheap to recompute on next request
+    }
+    c.insert(id.to_string(), report);
 }
 
 pub async fn handle_crop(state: Arc<AppState>, id: String) -> Response<Body> {
@@ -219,9 +233,14 @@ pub async fn handle_crop(state: Arc<AppState>, id: String) -> Response<Body> {
     // Ensure the file (de-dupes with a concurrent /play), then detect. If either fails, answer
     // "unknown" so the app just plays normally — and don't cache that, so it retries later.
     let report = match fetch_trailer(state.clone(), id.clone()).await {
+        // The download may have just cached the report (download_cached detects+bakes); reuse it
+        // instead of a second cropdetect pass.
+        Ok(_) if state.crop_cache.lock().unwrap().contains_key(&id) => {
+            state.crop_cache.lock().unwrap().get(&id).cloned().unwrap()
+        }
         Ok(fp) => match detect(&state.cfg, &id, &fp).await {
             Some(r) => {
-                state.crop_cache.lock().unwrap().insert(id.clone(), r.clone());
+                cache_report(&state, &id, r.clone());
                 r
             }
             None => CropReport::unknown(&id),

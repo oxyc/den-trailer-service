@@ -102,6 +102,8 @@ fn build_state(cache_dir: PathBuf, upstream: Box<dyn Upstream>, prober: ProbeFn,
         prober,
         prewarm,
         clock: Box::new(default_clock),
+        download_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::DOWNLOAD_CONCURRENCY)),
+        probe_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::PROBE_CONCURRENCY)),
     })
 }
 

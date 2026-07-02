@@ -3,11 +3,15 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::config::Config;
+
+const PROBE_TIMEOUT_SECS: u64 = 30; // yt-dlp --simulate should be quick; backstop a hang
+const DOWNLOAD_TIMEOUT_SECS: u64 = 240; // download+mux backstop (yt-dlp also gets --socket-timeout)
 
 /// A typed `/play` failure: an HTTP status + a short machine reason + a user-facing message.
 /// Clone-able because the in-flight de-dupe shares one download future across waiters.
@@ -27,6 +31,14 @@ impl PlayError {
             reason: "extraction_failed".into(),
             message: "Could not fetch this trailer.".into(),
             detail: format!("spawn yt-dlp: {e}"),
+        }
+    }
+    fn timed_out() -> PlayError {
+        PlayError {
+            status: 504,
+            reason: "timeout".into(),
+            message: "This trailer took too long to fetch.".into(),
+            detail: format!("yt-dlp exceeded {DOWNLOAD_TIMEOUT_SECS}s"),
         }
     }
 }
@@ -74,24 +86,28 @@ fn watch_url(vid: &str) -> String {
 /// `--simulate`, no download. Any spawn/exec error counts as "not extractable".
 pub async fn probe_extractable(cfg: &Config, vid: &str) -> bool {
     let cache = cfg.ytdlp_cache.to_string_lossy().into_owned();
-    let status = Command::new(&cfg.ytdlp)
-        .args([
-            "-q",
-            "--simulate",
-            "--no-warnings",
-            "--cache-dir",
-            &cache,
-            "-f",
-            &cfg.ytdlp_format,
-            &watch_url(vid),
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true) // if first_playable cancels a losing probe, kill its yt-dlp too
-        .status()
-        .await;
-    matches!(status, Ok(s) if s.success())
+    let mut cmd = Command::new(&cfg.ytdlp);
+    cmd.args([
+        "-q",
+        "--simulate",
+        "--no-warnings",
+        "--socket-timeout",
+        "15",
+        "--cache-dir",
+        &cache,
+        "-f",
+        &cfg.ytdlp_format,
+        &watch_url(vid),
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .kill_on_drop(true); // cancelled/timed-out probe kills its yt-dlp too
+    // Timeout backstop: on elapse the status future is dropped → kill_on_drop reaps → "not playable".
+    matches!(
+        tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), cmd.status()).await,
+        Ok(Ok(s)) if s.success()
+    )
 }
 
 /// Run yt-dlp+ffmpeg to produce a faststart MP4 at `tmp`. Returns `Ok` iff the process exited 0 and
@@ -100,48 +116,57 @@ pub async fn probe_extractable(cfg: &Config, vid: &str) -> bool {
 pub async fn download_to(cfg: &Config, vid: &str, tmp: &Path) -> Result<(), PlayError> {
     let cache = cfg.ytdlp_cache.to_string_lossy().into_owned();
     let tmp_s = tmp.to_string_lossy().into_owned();
-    let mut child = Command::new(&cfg.ytdlp)
-        .args([
-            "-q",
-            "--no-playlist",
-            "--no-warnings",
-            "--cache-dir",
-            &cache, // reuse the nsig/player-JS work the probe already did
-            "-N",
-            "4", // parallel DASH fragments → faster download
-            // AVPlayer hardware-decodable: H.264 (avc1) + AAC (mp4a) — same string the probe validates.
-            "-f",
-            &cfg.ytdlp_format,
-            "--merge-output-format",
-            "mp4",
-            // faststart during the merge's ffmpeg (one pass), not a separate whole-file rewrite.
-            "--postprocessor-args",
-            "Merger+ffmpeg:-movflags +faststart",
-            "-o",
-            &tmp_s,
-            &watch_url(vid),
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true) // don't leave an orphaned yt-dlp/ffmpeg if the task is dropped
-        .spawn()
-        .map_err(PlayError::spawn)?;
+    let work = async {
+        let mut child = Command::new(&cfg.ytdlp)
+            .args([
+                "-q",
+                "--no-playlist",
+                "--no-warnings",
+                "--socket-timeout",
+                "15", // yt-dlp aborts stalled sockets itself; the outer timeout is a backstop
+                "--cache-dir",
+                &cache, // reuse the nsig/player-JS work the probe already did
+                "-N",
+                "4", // parallel DASH fragments → faster download
+                // AVPlayer hardware-decodable: H.264 (avc1) + AAC (mp4a) — same string the probe validates.
+                "-f",
+                &cfg.ytdlp_format,
+                "--merge-output-format",
+                "mp4",
+                // faststart during the merge's ffmpeg (one pass), not a separate whole-file rewrite.
+                "--postprocessor-args",
+                "Merger+ffmpeg:-movflags +faststart",
+                "-o",
+                &tmp_s,
+                &watch_url(vid),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true) // don't leave an orphaned yt-dlp/ffmpeg if the task is dropped
+            .spawn()
+            .map_err(PlayError::spawn)?;
 
-    // Drain stderr concurrently with wait() so a chatty yt-dlp can't deadlock on a full pipe.
-    let mut stderr_pipe = child.stderr.take().expect("stderr piped");
-    let drain = tokio::spawn(async move {
-        let mut buf = String::new();
-        let _ = stderr_pipe.read_to_string(&mut buf).await;
-        buf
-    });
-    let status = child.wait().await.map_err(PlayError::spawn)?;
-    let stderr = drain.await.unwrap_or_default();
+        // Drain stderr concurrently with wait() so a chatty yt-dlp can't deadlock on a full pipe.
+        let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+        let drain = tokio::spawn(async move {
+            let mut buf = String::new();
+            let _ = stderr_pipe.read_to_string(&mut buf).await;
+            buf
+        });
+        let status = child.wait().await.map_err(PlayError::spawn)?;
+        let stderr = drain.await.unwrap_or_default();
 
-    let wrote = tokio::fs::metadata(tmp).await.map(|m| m.len() > 0).unwrap_or(false);
-    if status.success() && wrote {
-        Ok(())
-    } else {
-        Err(classify(status.code(), &stderr))
+        let wrote = tokio::fs::metadata(tmp).await.map(|m| m.len() > 0).unwrap_or(false);
+        if status.success() && wrote {
+            Ok(())
+        } else {
+            Err(classify(status.code(), &stderr))
+        }
+    };
+    // On timeout the work future (owning `child`) is dropped → kill_on_drop reaps yt-dlp/ffmpeg.
+    match tokio::time::timeout(Duration::from_secs(DOWNLOAD_TIMEOUT_SECS), work).await {
+        Ok(r) => r,
+        Err(_) => Err(PlayError::timed_out()),
     }
 }

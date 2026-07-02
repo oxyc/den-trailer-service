@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::future::Shared;
+use tokio::sync::Semaphore;
 
 use crate::config::Config;
 use crate::upstream::{HttpUpstream, Upstream};
@@ -45,6 +46,10 @@ pub struct AppState {
     pub prober: ProbeFn,
     pub prewarm: PrewarmFn,
     pub clock: ClockFn,
+    /// Global caps on concurrent subprocess trees, so a burst of distinct ids can't fork-bomb the
+    /// box: downloads (yt-dlp+ffmpeg) and probes (yt-dlp --simulate).
+    pub download_sem: Arc<Semaphore>,
+    pub probe_sem: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -57,6 +62,7 @@ impl AppState {
             .build()
             .expect("reqwest client");
         let upstream = Box::new(HttpUpstream::new(cfg.clone(), http));
+        let probe_sem = Arc::new(Semaphore::new(crate::PROBE_CONCURRENCY));
         Arc::new(AppState {
             cfg: cfg.clone(),
             yt_cache: Mutex::new(HashMap::new()),
@@ -64,18 +70,25 @@ impl AppState {
             dl_gen: AtomicU64::new(0),
             crop_cache: Mutex::new(HashMap::new()),
             upstream,
-            prober: default_prober(cfg),
+            prober: default_prober(cfg, probe_sem.clone()),
             prewarm: default_prewarm(),
             clock: Box::new(default_clock),
+            download_sem: Arc::new(Semaphore::new(crate::DOWNLOAD_CONCURRENCY)),
+            probe_sem,
         })
     }
 }
 
-/// Real prober: ask yt-dlp (simulate) whether the id is extractable here.
-pub fn default_prober(cfg: Arc<Config>) -> ProbeFn {
+/// Real prober: ask yt-dlp (simulate) whether the id is extractable here, holding a probe permit so
+/// a `/meta` fan-out (and concurrent `/meta`s) can't spawn unbounded yt-dlp processes.
+pub fn default_prober(cfg: Arc<Config>, sem: Arc<Semaphore>) -> ProbeFn {
     Box::new(move |vid: String| {
         let cfg = cfg.clone();
-        Box::pin(async move { ytdlp::probe_extractable(&cfg, &vid).await })
+        let sem = sem.clone();
+        Box::pin(async move {
+            let _permit = sem.acquire().await;
+            ytdlp::probe_extractable(&cfg, &vid).await
+        })
     })
 }
 
