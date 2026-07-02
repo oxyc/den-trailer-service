@@ -139,6 +139,16 @@ async fn download_cached(state: Arc<AppState>, vid: String, gen: u64) -> Result<
         message: "Could not fetch this trailer.".into(),
         detail: format!("rename {}: {e}", tmp.display()),
     })?;
+
+    // Best-effort: detect the content rect (cached for /crop) and bake a `clap` box so the billboard
+    // AVPlayer crops baked-in letterbox with no app change. Never fails the download — a play must
+    // never break because crop detection did. Runs before we return, so the file the de-duped /play
+    // serves already carries the clap (the billboard is prewarmed, so this is off the hot path).
+    if let Some(report) = crate::crop::detect(&state.cfg, &vid, &fp).await {
+        state.crop_cache.lock().unwrap().insert(vid.clone(), report.clone());
+        crate::crop::bake_clap(&state.cfg, &fp, &report).await;
+    }
+
     let cfg = state.cfg.clone();
     let _ = tokio::task::spawn_blocking(move || evict_if_needed(&cfg)).await;
     Ok(fp)

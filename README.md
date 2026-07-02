@@ -71,6 +71,13 @@ construction**: cropdetect reports the bounding box of everything non-black, so 
 never cropped away (worst case a trailer just keeps its bars). `/crop` shares the download with
 `/play` (call it at play time) and caches the result; the `/play` download+serve path is untouched.
 
+**Baked `clap`.** When a letterbox is detected, den-reel also writes a `clap` (clean aperture) box
+into the cached MP4 (via MP4Box — ~13 ms, +40 bytes, no re-encode, faststart preserved). Apple's
+AVPlayer honors clean aperture, so a direct-to-`AVPlayer` client (Den's billboard trailer) crops
+the bars with **zero client changes** — no `/crop` call needed. Offsets are content-centre-relative,
+so a symmetric letterbox is `0` and an off-centre crop (logo kept in one bar) gets the right
+offset. Clients that ignore `clap` just see the full frame. Set `CLAP=0` to disable baking.
+
 `/play` failures return a real status + JSON so the caller can say *why*:
 
 ```
@@ -110,6 +117,8 @@ Tests: `cargo test` (hermetic — a fake upstream + stubbed prober, no network, 
 | `CACHE_DIR` | `$TMPDIR/den-reel-cache` | persist with a volume |
 | `YTDLP_PATH` | `yt-dlp` | path to the yt-dlp binary |
 | `FFMPEG_PATH` | `ffmpeg` | path to ffmpeg (used by `/crop` cropdetect) |
+| `MP4BOX_PATH` | `MP4Box` | path to GPAC MP4Box (writes the baked `clap` box) |
+| `CLAP` | `1` | set `0` to disable baking the `clap` letterbox-crop box |
 | `MAX_HEIGHT` | `1080` | avc1 caps at 1080p on YouTube |
 | `CACHE_MAX_BYTES` | `8589934592` (8 GB) | LRU eviction threshold |
 

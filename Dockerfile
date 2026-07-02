@@ -15,6 +15,16 @@ RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release --lo
 COPY src ./src
 RUN touch src/main.rs && cargo build --release --locked   # `strip = true` in the release profile
 
+# ---- build MP4Box (GPAC) — writes the clap box; gpac is gone from Debian repos ----------
+# Plain default build → MP4Box + libgpac.so (~10 MB total), linking only libc/libm/libz. Copying the
+# two artifacts keeps the runtime debian-slim instead of pulling gpac's ~200-package apt tree.
+FROM debian:bookworm-slim AS mp4box
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential zlib1g-dev git ca-certificates && rm -rf /var/lib/apt/lists/*
+ARG GPAC_VERSION=v2.4.0
+RUN git clone --depth 1 --branch ${GPAC_VERSION} https://github.com/gpac/gpac.git /gpac \
+    && cd /gpac && ./configure && make -j"$(nproc)"
+
 # ---- fetch extractor tools (curl/unzip stay OUT of the runtime image) ------
 FROM debian:bookworm-slim AS tools
 ARG TARGETARCH
@@ -52,12 +62,17 @@ RUN set -eux; \
 # ---- runtime --------------------------------------------------------------
 FROM debian:bookworm-slim
 
-# ffmpeg (mux/faststart) + ca-certificates (TLS roots). curl/unzip were build-only, so they're gone.
+# ffmpeg (mux/faststart + cropdetect) + ca-certificates (TLS roots). curl/unzip were build-only, so
+# they're gone; MP4Box comes from the build stage below, not apt.
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=tools /usr/local/bin/deno /usr/local/bin/deno
 COPY --from=tools /usr/local/bin/yt-dlp /usr/local/bin/yt-dlp
+# MP4Box + its shared lib (clap writer). ldconfig regenerates the libgpac.so.12 SONAME link.
+COPY --from=mp4box /gpac/bin/gcc/MP4Box /usr/local/bin/MP4Box
+COPY --from=mp4box /gpac/bin/gcc/libgpac.so.12.* /usr/local/lib/
+RUN ldconfig
 COPY --from=build /src/target/release/den-reel /usr/local/bin/den-reel
 
 WORKDIR /app

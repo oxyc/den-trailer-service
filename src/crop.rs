@@ -168,6 +168,50 @@ pub async fn detect(cfg: &Config, id: &str, fp: &Path) -> Option<CropReport> {
     Some(report_from(id, parse_source_dims(&stderr), raw))
 }
 
+/// The `clap` box params for a letterboxed report: `(width, height, horizOffNum, vertOffNum)`, each
+/// offset over denominator 2. Offsets are the content-centre relative to the frame centre — so a
+/// symmetric letterbox is 0, and an off-centre crop (e.g. a logo kept in one bar) gets the right
+/// nonzero value. `None` when there's nothing worth cropping.
+pub fn clap_params(report: &CropReport) -> Option<(u32, u32, i64, i64)> {
+    if !report.letterboxed {
+        return None;
+    }
+    let src = report.source.as_ref()?;
+    let c = report.content.as_ref()?;
+    let ho = 2 * c.x as i64 + c.w as i64 - src.w as i64;
+    let vo = 2 * c.y as i64 + c.h as i64 - src.h as i64;
+    Some((c.w, c.h, ho, vo))
+}
+
+/// Bake a `clap` box into the cached MP4 in place (MP4Box, ~13 ms, +40 bytes, no re-encode,
+/// faststart preserved) so the billboard AVPlayer crops the letterbox. Best-effort: any failure is
+/// logged and ignored — the un-clap'd file still plays fine (clients that don't read clap just show
+/// the full frame). No-op when disabled or not letterboxed.
+pub async fn bake_clap(cfg: &Config, fp: &Path, report: &CropReport) -> bool {
+    if !cfg.bake_clap {
+        return false;
+    }
+    let Some((w, h, ho, vo)) = clap_params(report) else {
+        return false;
+    };
+    let spec = format!("1={w},1,{h},1,{ho},2,{vo},2");
+    let status = Command::new(&cfg.mp4box)
+        .args(["-clap", &spec, &fp.to_string_lossy()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .status()
+        .await;
+    match status {
+        Ok(s) if s.success() => true,
+        other => {
+            eprintln!("bake_clap {}: {other:?}", fp.display());
+            false
+        }
+    }
+}
+
 pub async fn handle_crop(state: Arc<AppState>, id: String) -> Response<Body> {
     if let Some(cached) = state.crop_cache.lock().unwrap().get(&id).cloned() {
         return json(&cached);

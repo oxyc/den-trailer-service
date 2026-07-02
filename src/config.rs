@@ -12,6 +12,12 @@ pub struct Config {
     pub ytdlp: String,
     /// ffmpeg binary (same one yt-dlp merges with) — used for the /crop cropdetect pass.
     pub ffmpeg: String,
+    /// GPAC MP4Box binary — writes the `clap` (clean aperture) box so the billboard AVPlayer crops
+    /// baked-in letterbox with no app change.
+    pub mp4box: String,
+    /// Bake a `clap` box into the cached MP4 when a letterbox is detected. On by default; set
+    /// `CLAP=0` to disable (escape hatch if a trailer ever crops wrong in prod).
+    pub bake_clap: bool,
     pub max_height: String,
     pub cache_max_bytes: u64,
     /// Persist yt-dlp's nsig/player-JS cache across restarts (a subdir of the media cache).
@@ -59,6 +65,8 @@ impl Config {
             cache_dir,
             ytdlp: env_opt("YTDLP_PATH").unwrap_or_else(|| "yt-dlp".to_string()),
             ffmpeg: env_opt("FFMPEG_PATH").unwrap_or_else(|| "ffmpeg".to_string()),
+            mp4box: env_opt("MP4BOX_PATH").unwrap_or_else(|| "MP4Box".to_string()),
+            bake_clap: env_opt("CLAP").as_deref() != Some("0"),
             max_height,
             cache_max_bytes,
             ytdlp_cache,

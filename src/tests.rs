@@ -71,6 +71,8 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
         cache_dir,
         ytdlp: "yt-dlp".into(),
         ffmpeg: "ffmpeg".into(),
+        mp4box: "MP4Box".into(),
+        bake_clap: true,
         max_height: "1080".into(),
         cache_max_bytes: 8 * 1024 * 1024 * 1024,
         tmdb_key: Some("test-key".into()),
@@ -339,6 +341,51 @@ fn report_flags_letterbox_but_not_pixel_noise() {
     // 1080 → 1072 content = 8px (<2%) → treated as noise, not letterboxed.
     let noise = crate::crop::report_from("x", Some((1920, 1080)), crate::crop::RawCrop { w: 1920, h: 1072, x: 0, y: 4 });
     assert!(!noise.letterboxed);
+}
+
+// Exercises the real detect()+bake_clap() path against ffmpeg + MP4Box. Kept out of CI (which has
+// neither). Run locally with: cargo test -- --ignored
+#[tokio::test]
+#[ignore]
+async fn clap_pipeline_bakes_box_end_to_end() {
+    let dir = temp_dir();
+    let fp = dir.join("clapvid0001.mp4");
+    // 1920x1080 with a 1920x816 testsrc content region and 132px black bars top/bottom.
+    let ok = std::process::Command::new("ffmpeg")
+        .args(["-y", "-f", "lavfi", "-i", "testsrc=size=1920x816:rate=24:d=2",
+               "-vf", "pad=1920:1080:0:132:color=black", "-c:v", "libx264",
+               "-g", "6", "-pix_fmt", "yuv420p", "-movflags", "+faststart"])
+        .arg(&fp)
+        .status().unwrap().success();
+    assert!(ok, "ffmpeg failed to build the letterbox fixture");
+
+    let cfg = test_cfg(dir);
+    let report = crate::crop::detect(&cfg, "clapvid0001", &fp).await.expect("detect returned a rect");
+    assert!(report.letterboxed, "132px bars should read as letterboxed");
+    assert_eq!(report.content.as_ref().unwrap().h, 816);
+    assert!(crate::crop::bake_clap(&cfg, &fp, &report).await, "MP4Box should write the clap box");
+
+    // ffprobe reads the clap back as frame cropping — 132px top & bottom.
+    let out = std::process::Command::new("ffprobe")
+        .args(["-hide_banner", "-v", "error", "-show_streams"]).arg(&fp)
+        .output().unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("crop_top=132") && s.contains("crop_bottom=132"), "clap not read back: {s}");
+}
+
+#[test]
+fn clap_params_are_center_relative() {
+    // Symmetric 2.35 letterbox → offsets 0 (content centre == frame centre).
+    let centered = crate::crop::report_from("x", Some((1920, 1080)), crate::crop::RawCrop { w: 1920, h: 816, x: 0, y: 132 });
+    assert_eq!(crate::crop::clap_params(&centered), Some((1920, 816, 0, 0)));
+
+    // Logo kept in the bottom bar → content off-centre downward → positive vertOff (num over 2).
+    let off = crate::crop::report_from("x", Some((1920, 1080)), crate::crop::RawCrop { w: 1920, h: 922, x: 0, y: 132 });
+    assert_eq!(crate::crop::clap_params(&off), Some((1920, 922, 0, 106))); // 106/2 = 53px
+
+    // Not letterboxed → nothing to bake.
+    let full = crate::crop::report_from("x", Some((1920, 1080)), crate::crop::RawCrop { w: 1920, h: 1080, x: 0, y: 0 });
+    assert_eq!(crate::crop::clap_params(&full), None);
 }
 
 #[test]
