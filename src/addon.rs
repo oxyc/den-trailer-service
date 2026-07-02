@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use crate::httputil::{self, query_param, Body};
 use crate::state::{AppState, YtEntry};
-use crate::{MAX_PROBE, YT_NEG_TTL_MS, YT_TTL_MS};
+use crate::{MAX_PROBE, YT_CACHE_MAX, YT_NEG_TTL_MS, YT_TTL_MS};
 
 pub fn manifest() -> Value {
     json!({
@@ -82,13 +82,18 @@ async fn first_playable(state: &Arc<AppState>, candidates: &[String]) -> String 
     }
     let rest = &candidates[1..];
     // Spawn so the probes actually run concurrently (futures are lazy)...
-    let handles: Vec<_> = rest
+    let mut handles: Vec<_> = rest
         .iter()
         .map(|c| tokio::spawn((state.prober)(c.clone())))
         .collect();
-    for (i, h) in handles.into_iter().enumerate() {
-        if h.await.unwrap_or(false) {
-            return rest[i].clone(); // ...but await in rank order → highest-ranked winner
+    for i in 0..handles.len() {
+        if (&mut handles[i]).await.unwrap_or(false) {
+            // ...but await in rank order → highest-ranked winner. Cancel the probes we no longer
+            // need (their yt-dlp --simulate processes die with the task via kill_on_drop).
+            for h in &handles[i + 1..] {
+                h.abort();
+            }
+            return rest[i].clone();
         }
     }
     String::new()
@@ -122,13 +127,16 @@ pub async fn resolve_youtube_id(state: &Arc<AppState>, imdb: &str, ty: &str, lan
     candidates.truncate(MAX_PROBE);
     let id = first_playable(state, &candidates).await;
     let ttl = if id.is_empty() { YT_NEG_TTL_MS } else { YT_TTL_MS };
-    state.yt_cache.lock().unwrap().insert(
-        cache_key,
-        YtEntry {
-            id: id.clone(),
-            exp: (state.clock)() + ttl,
-        },
-    );
+    {
+        let mut cache = state.yt_cache.lock().unwrap();
+        // Bound growth: when the map gets large, sweep expired entries before inserting so a
+        // long-running instance with many distinct lookups doesn't leak unboundedly.
+        if cache.len() >= YT_CACHE_MAX {
+            let now = (state.clock)();
+            cache.retain(|_, e| e.exp > now);
+        }
+        cache.insert(cache_key, YtEntry { id: id.clone(), exp: (state.clock)() + ttl });
+    }
     id
 }
 

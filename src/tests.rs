@@ -93,6 +93,7 @@ fn build_state(cache_dir: PathBuf, upstream: Box<dyn Upstream>, prober: ProbeFn,
         cfg: Arc::new(test_cfg(cache_dir)),
         yt_cache: Mutex::new(HashMap::new()),
         in_flight: Mutex::new(HashMap::new()),
+        dl_gen: std::sync::atomic::AtomicU64::new(0),
         upstream,
         prober,
         prewarm,
@@ -305,6 +306,21 @@ async fn play_with_range_is_206() {
     assert_eq!(r.headers().get("content-range").unwrap(), &format!("bytes 0-99/{size}"));
     assert_eq!(r.headers().get("content-length").unwrap(), "100");
     assert_eq!(r.headers().get("accept-ranges").unwrap(), "bytes");
+}
+
+#[test]
+fn eviction_evicts_real_files_but_skips_partial_dotfiles() {
+    let dir = temp_dir();
+    std::fs::write(dir.join("aaaaaa.mp4"), vec![0u8; 100]).unwrap();
+    std::fs::write(dir.join(".bbbbbb.123.0.partial.mp4"), vec![0u8; 100]).unwrap();
+    let mut cfg = test_cfg(dir.clone());
+    cfg.cache_max_bytes = 1; // force eviction of everything eligible
+    crate::play::evict_if_needed(&cfg);
+    assert!(!dir.join("aaaaaa.mp4").exists(), "completed file should be evicted");
+    assert!(
+        dir.join(".bbbbbb.123.0.partial.mp4").exists(),
+        "in-progress .partial temp must be skipped by eviction"
+    );
 }
 
 #[tokio::test]

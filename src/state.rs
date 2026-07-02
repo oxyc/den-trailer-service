@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,8 +34,11 @@ pub struct AppState {
     /// Cache the STABLE ytId (the expensive lookup); playback is just our /play proxy for it.
     /// In-memory (24h TTL) — cheap to rebuild on restart, no external store needed. "" = "no trailer".
     pub yt_cache: Mutex<HashMap<String, YtEntry>>,
-    /// vid -> shared download future, so concurrent /play (and prewarm) share one yt-dlp run.
-    pub in_flight: Mutex<HashMap<String, SharedDownload>>,
+    /// vid -> (generation, shared download future), so concurrent /play (and prewarm) share one
+    /// yt-dlp run. The generation lets the creator clear its own entry without clobbering a newer one.
+    pub in_flight: Mutex<HashMap<String, (u64, SharedDownload)>>,
+    /// Monotonic id handed to each created download (map tag + unique temp-file suffix).
+    pub dl_gen: AtomicU64,
     pub upstream: Box<dyn Upstream>,
     pub prober: ProbeFn,
     pub prewarm: PrewarmFn,
@@ -55,6 +59,7 @@ impl AppState {
             cfg: cfg.clone(),
             yt_cache: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(HashMap::new()),
+            dl_gen: AtomicU64::new(0),
             upstream,
             prober: default_prober(cfg),
             prewarm: default_prewarm(),

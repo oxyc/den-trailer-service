@@ -88,6 +88,7 @@ pub async fn probe_extractable(cfg: &Config, vid: &str) -> bool {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .kill_on_drop(true) // if first_playable cancels a losing probe, kill its yt-dlp too
         .status()
         .await;
     matches!(status, Ok(s) if s.success())
@@ -123,6 +124,7 @@ pub async fn download_to(cfg: &Config, vid: &str, tmp: &Path) -> Result<(), Play
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
+        .kill_on_drop(true) // don't leave an orphaned yt-dlp/ffmpeg if the task is dropped
         .spawn()
         .map_err(PlayError::spawn)?;
 

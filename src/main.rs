@@ -39,6 +39,7 @@ pub const MAX_PROBE: usize = 6; // cap how many trailer candidates we validate p
 pub const PREWARM_MAX: usize = 3; // cap concurrent prewarm downloads (bounds a burst of /meta calls)
 pub const YT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 pub const YT_NEG_TTL_MS: u64 = 60 * 60 * 1000; // "nothing playable" caches shorter (geo/transient may lift)
+pub const YT_CACHE_MAX: usize = 10_000; // sweep expired entries once the resolve cache grows past this
 
 /// A YouTube id as it appears in a /play path or `?v=`: `[A-Za-z0-9_-]{6,15}`.
 pub fn is_valid_vid(id: &str) -> bool {
@@ -101,7 +102,15 @@ async fn run(cfg: Config) -> std::io::Result<()> {
     );
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        // A transient accept error (e.g. EMFILE under an fd-exhausting burst) must not take the
+        // whole server down — log and keep accepting.
+        let (stream, _) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("accept: {e}");
+                continue;
+            }
+        };
         let state = state.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
