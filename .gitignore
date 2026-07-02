@@ -1,4 +1,4 @@
-node_modules/
+/target
 cache/
 *.mp4
 .dev.vars

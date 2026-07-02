@@ -1,7 +1,10 @@
-# den trailer-service
+# den-reel
 
 The whole trailer path for [Den](https://github.com/oxyc/den) in **one container**: the addon
 that finds a movie's trailer **and** the proxy that makes it play inline on tvOS.
+
+A single ~2 MB Rust binary (async, no GC) + yt-dlp + ffmpeg — sized for a homelab: a few MB of
+resident RAM at idle, the image weight is just the extractor toolchain.
 
 ```
 Den (Apple TV) ──/meta/movie/<imdbId>.json──►  addon    imdbId → TMDB → ytId
@@ -64,9 +67,9 @@ so the URL it hands back actually plays. `links: []` means "nothing playable in 
 ## Run
 
 ```bash
-docker build -t den-trailer-service .
-docker run -d --name trailers -p 8092:8092 -v den-trailer-cache:/cache \
-  -e TMDB_KEY=<your-tmdb-key> den-trailer-service
+docker build -t den-reel .
+docker run -d --name trailers -p 8092:8092 -v den-reel-cache:/cache \
+  -e TMDB_KEY=<your-tmdb-key> den-reel
 curl http://localhost:8092/meta/movie/tt0111161.json          # → a /play URL
 curl -o t.mp4 http://localhost:8092/play/dSdWpY2Bxsc.mp4       # playback smoke test
 ```
@@ -76,8 +79,9 @@ In the homelab it runs behind Caddy at `https://trailers.<domain>` (compose prof
 `https://trailers.<domain>/play/…` URLs with no extra config. Add
 `https://trailers.<domain>/manifest.json` to Den (Settings → Plugins, or `dev-addons.json`).
 
-Without Docker (needs `node`, `ffmpeg`, `yt-dlp` on PATH): `TMDB_KEY=… node server.js`.
-Tests: `npm test` (Node's built-in runner, no deps — stubs `fetch`).
+Without Docker (needs `ffmpeg`, `yt-dlp`, and a JS runtime like `deno` on PATH):
+`TMDB_KEY=… cargo run --release`.
+Tests: `cargo test` (hermetic — a fake upstream + stubbed prober, no network, no yt-dlp).
 
 ## Config (env)
 
@@ -87,7 +91,7 @@ Tests: `npm test` (Node's built-in runner, no deps — stubs `fetch`).
 | `KINOCHECK_KEY` | — | optional discovery fallback when TMDB has no trailer |
 | `PUBLIC_BASE_URL` | *(from request)* | override the base used in play URLs; usually unneeded behind Caddy |
 | `PORT` | `8092` | |
-| `CACHE_DIR` | `$TMPDIR/den-trailer-cache` | persist with a volume |
+| `CACHE_DIR` | `$TMPDIR/den-reel-cache` | persist with a volume |
 | `YTDLP_PATH` | `yt-dlp` | path to the yt-dlp binary |
 | `MAX_HEIGHT` | `1080` | avc1 caps at 1080p on YouTube |
 | `CACHE_MAX_BYTES` | `8589934592` (8 GB) | LRU eviction threshold |
@@ -97,5 +101,5 @@ Tests: `npm test` (Node's built-in runner, no deps — stubs `fetch`).
 YouTube changes frequently. Keep yt-dlp current — bump `YTDLP_VERSION` in the `Dockerfile`
 when extraction starts failing. The image also bundles **deno** (`DENO_VERSION`): recent
 yt-dlp needs a JS runtime to solve YouTube's signature challenge, and without it extraction
-degrades and fails intermittently. That's the whole upkeep. The GH Action publishes
-`ghcr.io/oxyc/den-trailer-service` on every push to `main` and on `v*` tags.
+degrades and fails intermittently. That's the whole upkeep. The GH Action runs `cargo clippy`
++ `cargo test`, then publishes `ghcr.io/oxyc/den-reel` on every push to `main` and on `v*` tags.

@@ -1,6 +1,6 @@
-# Build the trailer-service image and push it to GitHub Container Registry.
-# The homelab compose pulls ghcr.io/oxyc/den-trailer-service:<tag> (like Frigate/Scrypted),
-# so a code change here → new image → `docker compose pull && up -d` on the box. No app release.
+# Build the den-reel image and push it to GitHub Container Registry.
+# The homelab compose pulls ghcr.io/oxyc/den-reel:<tag> (like Frigate/Scrypted), so a code change
+# here → new image → `docker compose pull && up -d` on the box. No app release.
 name: docker-publish
 
 on:
@@ -10,10 +10,22 @@ on:
   workflow_dispatch:
 
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/den-trailer-service
+  IMAGE: ghcr.io/${{ github.repository_owner }}/den-reel
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --release
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read

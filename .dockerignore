@@ -1,6 +1,6 @@
 .git
 .github
-node_modules
+target
 *.md
 !README.md
 .dev.vars

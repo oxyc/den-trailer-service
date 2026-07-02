@@ -1,0 +1,40 @@
+[package]
+name = "den-reel"
+version = "0.2.0"
+edition = "2021"
+description = "Den trailers, one container: addon (imdb→ytId via TMDB) + yt-dlp/ffmpeg proxy (ytId→faststart MP4) for inline tvOS playback"
+publish = false
+
+[[bin]]
+name = "den-reel"
+path = "src/main.rs"
+
+[dependencies]
+# Single-threaded async runtime — this is an I/O-bound proxy; the CPU work lives in the
+# yt-dlp/ffmpeg subprocesses, not here. current_thread keeps the resident thread count (and RAM)
+# minimal on a homelab box.
+tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "signal"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# rustls (not OpenSSL) with bundled webpki roots → no ca-certificates package needed at runtime,
+# and a static-friendly TLS stack for a slim image.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "net", "process", "fs", "io-util", "time", "sync", "signal", "test-util"] }
+
+# A small, fast, self-contained binary for a resource-constrained homelab: optimize for size,
+# strip symbols, fat LTO, abort on panic (no unwtables), one codegen unit.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
