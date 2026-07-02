@@ -29,6 +29,14 @@ fn cache_path(cfg: &Config, vid: &str) -> PathBuf {
     cfg.cache_dir.join(format!("{vid}.mp4"))
 }
 
+/// Is the on-disk cache usable? `create_dir_all` is idempotent and cheap when the dir already
+/// exists, so this doubles as a self-healing check — a volume that comes back after boot recovers
+/// without a restart. `/play` and `/crop` gate on it to return a clean 503 instead of a murky 502.
+pub async fn cache_available(cfg: &Config) -> bool {
+    tokio::fs::create_dir_all(&cfg.cache_dir).await.is_ok()
+        && tokio::fs::create_dir_all(&cfg.ytdlp_cache).await.is_ok()
+}
+
 /// Bump a cached file's atime so the LRU eviction sees it as recently used. Fire-and-forget so the
 /// hot serve path isn't slowed; a rare eviction/serve race is handled by the open-miss refetch in
 /// `handle_play`.
@@ -93,7 +101,7 @@ pub async fn fetch_trailer(state: Arc<AppState>, vid: String) -> Result<PathBuf,
     // vid until restart) or leak the subprocess — this fn is now a pure waiter. The generation guard
     // means the driver only ever removes its own entry.
     let shared: SharedDownload = {
-        let mut map = state.in_flight.lock().unwrap();
+        let mut map = state.in_flight.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((_, existing)) = map.get(&vid) {
             existing.clone()
         } else {
@@ -110,7 +118,7 @@ pub async fn fetch_trailer(state: Arc<AppState>, vid: String) -> Result<PathBuf,
             let v = vid.clone();
             tokio::spawn(async move {
                 let _ = driver.await; // drive to completion even if every requester goes away
-                let mut map = st.in_flight.lock().unwrap();
+                let mut map = st.in_flight.lock().unwrap_or_else(|e| e.into_inner());
                 if matches!(map.get(&v), Some((g, _)) if *g == gen) {
                     map.remove(&v);
                 }
@@ -235,6 +243,13 @@ fn play_error(vid: &str, e: &PlayError) -> Response<Body> {
 }
 
 pub async fn handle_play(state: Arc<AppState>, headers: &HeaderMap, vid: String) -> Response<Body> {
+    if !cache_available(&state.cfg).await {
+        return httputil::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cache_unavailable",
+            "Trailer cache is unavailable.",
+        );
+    }
     let range = headers.get("range").and_then(|v| v.to_str().ok()).map(str::to_string);
     // At most two attempts: if the cached file is evicted between fetch and open, re-fetch once.
     for attempt in 0..2 {

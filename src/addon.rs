@@ -104,7 +104,7 @@ async fn first_playable(state: &Arc<AppState>, candidates: &[String]) -> String 
 pub async fn resolve_youtube_id(state: &Arc<AppState>, imdb: &str, ty: &str, lang: &str) -> String {
     let cache_key = format!("{imdb}:{lang}");
     {
-        let cache = state.yt_cache.lock().unwrap();
+        let cache = state.yt_cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(e) = cache.get(&cache_key) {
             if e.exp > (state.clock)() {
                 return e.id.clone();
@@ -128,7 +128,7 @@ pub async fn resolve_youtube_id(state: &Arc<AppState>, imdb: &str, ty: &str, lan
     let id = first_playable(state, &candidates).await;
     let ttl = if id.is_empty() { YT_NEG_TTL_MS } else { YT_TTL_MS };
     {
-        let mut cache = state.yt_cache.lock().unwrap();
+        let mut cache = state.yt_cache.lock().unwrap_or_else(|e| e.into_inner());
         // Bound growth: when the map gets large, sweep expired entries before inserting so a
         // long-running instance with many distinct lookups doesn't leak unboundedly.
         if cache.len() >= YT_CACHE_MAX {
@@ -162,12 +162,13 @@ pub async fn handle_meta(
         (state.prewarm)(state.clone(), yt_id.clone());
     }
     let payload = build_meta(ty, imdb, &base, &yt_id);
-    // Only cache a SUCCESSFUL resolution (a real trailer). Empty results stay uncached to re-check.
+    // A SUCCESSFUL resolution (a real trailer) is cacheable 7d; an empty result (no trailer /
+    // geo-blocked / a transient upstream fault) is no-store so the client re-checks a miss.
     let has_link = payload["meta"]["links"].as_array().is_some_and(|a| !a.is_empty());
     let extra: &[(&str, &str)] = if has_link {
         &[("cache-control", "public, max-age=604800")]
     } else {
-        &[]
+        &[("cache-control", "no-store")]
     };
     httputil::json(StatusCode::OK, &payload, extra)
 }

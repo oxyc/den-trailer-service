@@ -4,9 +4,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use serde_json::Value;
 
 use crate::config::Config;
+
+/// Max upstream JSON body we'll buffer. TMDB /videos + KinoCheck responses are a few KB; 4 MB is a
+/// generous ceiling that still stops a runaway/hostile body from ballooning memory.
+const MAX_UPSTREAM_BODY: usize = 4 * 1024 * 1024;
 
 /// The two upstream lookups the resolver needs. A miss/error is always an empty result (never an
 /// error to the caller) — same as the Node version's try/catch-to-`[]`.
@@ -63,12 +68,43 @@ impl HttpUpstream {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        let res = req.send().await.ok()?;
-        if !res.status().is_success() {
+        let res = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // A network/DNS/TLS fault is a HARD failure (vs a 200-with-no-results miss) — log it
+                // (path only; the api_key lives in the query string and is dropped by redact()).
+                eprintln!("upstream request failed: {} ({e})", redact(url));
+                return None;
+            }
+        };
+        let status = res.status();
+        if !status.is_success() {
+            // Surface the faults that mean "misconfigured / throttled / upstream down" — but not 404
+            // (a normal "not found" for KinoCheck), so a broken TMDB_KEY isn't a silent empty result.
+            if status == 401 || status == 403 || status == 429 || status.is_server_error() {
+                eprintln!("upstream {} -> {status}", redact(url));
+            }
             return None;
         }
-        res.json::<Value>().await.ok() // null (not throw) on a malformed body, like safeJson()
+        // Cap the body (defense-in-depth beyond the 15s timeout): these JSON payloads are small, so a
+        // multi-MB response is either broken or hostile — stop reading rather than buffer it all.
+        let mut stream = res.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.ok()?;
+            if buf.len() + chunk.len() > MAX_UPSTREAM_BODY {
+                eprintln!("upstream body over {MAX_UPSTREAM_BODY} bytes: {}", redact(url));
+                return None;
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&buf).ok() // null (not throw) on a malformed body, like safeJson()
     }
+}
+
+/// Drop the query string (which carries `api_key=…`) so a logged URL never leaks the key.
+fn redact(url: &str) -> &str {
+    url.split('?').next().unwrap_or(url)
 }
 
 #[async_trait]

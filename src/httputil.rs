@@ -28,19 +28,31 @@ pub fn json(
         .header("content-type", "application/json")
         .header("access-control-allow-origin", "*")
         .header("content-length", s.len());
+    let has_cc = extra.iter().any(|(k, _)| k.eq_ignore_ascii_case("cache-control"));
     for (k, v) in extra {
         b = b.header(*k, *v);
+    }
+    // Errors must never be cached (a transient 502/503/504 mustn't stick in a client/proxy cache).
+    if !status.is_success() && !has_cc {
+        b = b.header("cache-control", "no-store");
     }
     b.body(full(s)).unwrap()
 }
 
-/// Plain-text response (health, bad-request bodies).
+/// A typed error body `{ "error": <code>, "message": <msg> }` (no-store applied via `json`).
+pub fn error(status: StatusCode, code: &str, message: &str) -> Response<Body> {
+    json(status, &serde_json::json!({ "error": code, "message": message }), &[])
+}
+
+/// Plain-text response (health, bad-request bodies). Non-2xx get `Cache-Control: no-store`.
 pub fn text(status: StatusCode, msg: &'static str) -> Response<Body> {
-    Response::builder()
+    let mut b = Response::builder()
         .status(status)
-        .header("content-length", msg.len())
-        .body(full(msg))
-        .unwrap()
+        .header("content-length", msg.len());
+    if !status.is_success() {
+        b = b.header("cache-control", "no-store");
+    }
+    b.body(full(msg)).unwrap()
 }
 
 /// Look up a query-string parameter without pulling in a URL parser. Returns the decoded value of

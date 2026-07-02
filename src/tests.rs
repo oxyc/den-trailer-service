@@ -252,9 +252,9 @@ async fn get_meta_caches_success_not_empty() {
     assert!(ok.headers().get("cache-control").unwrap().to_str().unwrap().contains("max-age=604800"));
 
     state.yt_cache.lock().unwrap().clear();
-    fake.set_tmdb(&[]); // no trailer → empty links → must NOT be cached
+    fake.set_tmdb(&[]); // no trailer → empty links → no-store (client re-checks, doesn't cache a miss)
     let empty = client.get(format!("{base}/meta/movie/tt0111161.json")).send().await.unwrap();
-    assert!(empty.headers().get("cache-control").is_none());
+    assert_eq!(empty.headers().get("cache-control").unwrap(), "no-store");
     let body: Value = empty.json().await.unwrap();
     assert_eq!(body["meta"]["links"].as_array().unwrap().len(), 0);
 }
@@ -373,6 +373,33 @@ async fn clap_pipeline_bakes_box_end_to_end() {
         .output().unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("crop_top=132") && s.contains("crop_bottom=132"), "clap not read back: {s}");
+}
+
+#[tokio::test]
+async fn cache_available_reflects_dir_usability() {
+    let dir = temp_dir();
+    let cfg_ok = test_cfg(dir.clone());
+    assert!(crate::play::cache_available(&cfg_ok).await, "a normal temp dir is usable");
+
+    // Point cache_dir under a regular file so create_dir_all fails (ENOTDIR) → unavailable.
+    let file = dir.join("not-a-dir");
+    std::fs::write(&file, b"x").unwrap();
+    let mut cfg_bad = test_cfg(dir);
+    cfg_bad.cache_dir = file.join("cache");
+    cfg_bad.ytdlp_cache = cfg_bad.cache_dir.join("yt-dlp");
+    assert!(!crate::play::cache_available(&cfg_bad).await, "cache under a file is unusable");
+}
+
+#[test]
+fn error_responses_are_no_store() {
+    let e = crate::httputil::error(hyper::StatusCode::SERVICE_UNAVAILABLE, "cache_unavailable", "x");
+    assert_eq!(e.headers().get("cache-control").unwrap(), "no-store");
+    // 404 text path too.
+    let t = crate::httputil::text(hyper::StatusCode::NOT_FOUND, "not found");
+    assert_eq!(t.headers().get("cache-control").unwrap(), "no-store");
+    // ...but a 2xx isn't forced to no-store.
+    let ok = crate::httputil::text(hyper::StatusCode::OK, "ok");
+    assert!(ok.headers().get("cache-control").is_none());
 }
 
 #[test]

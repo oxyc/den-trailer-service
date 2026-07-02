@@ -219,7 +219,7 @@ pub async fn bake_clap(cfg: &Config, fp: &Path, report: &CropReport) -> bool {
 
 /// Insert a crop report into the cache, bounding growth (crop has no TTL, so cap the size).
 pub fn cache_report(state: &Arc<AppState>, id: &str, report: CropReport) {
-    let mut c = state.crop_cache.lock().unwrap();
+    let mut c = state.crop_cache.lock().unwrap_or_else(|e| e.into_inner());
     if c.len() >= CROP_CACHE_MAX {
         c.clear(); // crude but bounded; entries are cheap to recompute on next request
     }
@@ -227,24 +227,34 @@ pub fn cache_report(state: &Arc<AppState>, id: &str, report: CropReport) {
 }
 
 pub async fn handle_crop(state: Arc<AppState>, id: String) -> Response<Body> {
-    if let Some(cached) = state.crop_cache.lock().unwrap().get(&id).cloned() {
+    if !crate::play::cache_available(&state.cfg).await {
+        return httputil::error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cache_unavailable",
+            "Trailer cache is unavailable.",
+        );
+    }
+    if let Some(cached) = state.crop_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned() {
         return json(&cached);
     }
     // Ensure the file (de-dupes with a concurrent /play), then detect. If either fails, answer
     // "unknown" so the app just plays normally — and don't cache that, so it retries later.
     let report = match fetch_trailer(state.clone(), id.clone()).await {
-        // The download may have just cached the report (download_cached detects+bakes); reuse it
-        // instead of a second cropdetect pass.
-        Ok(_) if state.crop_cache.lock().unwrap().contains_key(&id) => {
-            state.crop_cache.lock().unwrap().get(&id).cloned().unwrap()
-        }
-        Ok(fp) => match detect(&state.cfg, &id, &fp).await {
-            Some(r) => {
-                cache_report(&state, &id, r.clone());
-                r
+        Ok(fp) => {
+            // download_cached may have just cached the report — reuse it with a SINGLE lock (using the
+            // Option directly, so a concurrent cache_report clear() can't wedge us on an unwrap).
+            let cached = state.crop_cache.lock().unwrap_or_else(|e| e.into_inner()).get(&id).cloned();
+            match cached {
+                Some(r) => r,
+                None => match detect(&state.cfg, &id, &fp).await {
+                    Some(r) => {
+                        cache_report(&state, &id, r.clone());
+                        r
+                    }
+                    None => CropReport::unknown(&id),
+                },
             }
-            None => CropReport::unknown(&id),
-        },
+        }
         Err(_) => CropReport::unknown(&id),
     };
     json(&report)

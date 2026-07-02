@@ -99,7 +99,14 @@ pub async fn handle_request(state: Arc<AppState>, req: Request<hyper::body::Inco
 }
 
 async fn run(cfg: Config) -> std::io::Result<()> {
-    std::fs::create_dir_all(&cfg.cache_dir)?;
+    // A bad CACHE_DIR must NOT crash-loop the process: discovery (/health, /manifest, /meta) doesn't
+    // need the cache, only /play and /crop do — and those return a structured 503 when it's missing.
+    if let Err(e) = std::fs::create_dir_all(&cfg.cache_dir) {
+        eprintln!(
+            "warning: cache dir {} is unusable ({e}); /play and /crop will 503 until it's writable",
+            cfg.cache_dir.display()
+        );
+    }
     let port = cfg.port;
     let addon_on = cfg.tmdb_key.is_some();
     let cache_disp = cfg.cache_dir.display().to_string();

@@ -99,7 +99,7 @@ pub fn default_prewarm() -> PrewarmFn {
         if id.is_empty() {
             return;
         }
-        let busy = state.in_flight.lock().unwrap().len();
+        let busy = state.in_flight.lock().unwrap_or_else(|e| e.into_inner()).len();
         if busy < crate::PREWARM_MAX {
             tokio::spawn(async move {
                 let _ = crate::play::fetch_trailer(state, id).await;
