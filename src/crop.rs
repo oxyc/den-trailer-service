@@ -8,6 +8,14 @@
 //! open (a persistent, whole-trailer logo still can). A minimum-content floor guards against
 //! over-cropping a dark trailer whose frames momentarily read as mostly black.
 //!
+//! **Full-frame guard.** A median alone would over-crop a *mixed-framing* trailer — one that's mostly
+//! letterboxed but has genuine full-frame shots (common in animated trailers: e.g. Monsters vs Aliens
+//! is ~2.35 with a few full-frame hero shots). The median picks the dominant letterbox and slices
+//! those shots. So if more than a stray keyframe is essentially the full frame, we DON'T crop at all —
+//! keeping bars beats shaving real content. A logo in a bar makes a frame *taller but not full*, so
+//! this guard never suppresses logo cropping. Net: identical to the old union on such trailers, but it
+//! additionally drops transient logos on genuinely-letterboxed ones.
+//!
 //! Exposed as `GET /crop/<id>.json`. Additive; the /play download+serve hot path is untouched — the
 //! (small) cropdetect cost is only paid when the app actually asks, and the result is cached.
 
@@ -42,6 +50,13 @@ const SNAP_KEEP_PX: u32 = 6;
 /// Never crop a top/bottom letterbox below this fraction of the source height. A more aggressive,
 /// non-standard vertical crop is treated as a dark-frame artifact and left uncropped (play full).
 const MIN_CONTENT_FRAC: f64 = 0.6;
+
+/// A keyframe whose box fills the frame (both bars ≤2%) counts as "full frame". If at least this many
+/// keyframes — AND this percent of them — are full-frame, the trailer genuinely uses the full frame
+/// (mixed framing), so we must not crop it. Two thresholds so a single stray full-frame flash on a
+/// clean letterbox doesn't suppress the crop, but a handful of real full-frame shots does.
+const FULL_FRAME_MIN: usize = 2;
+const FULL_FRAME_PCT: usize = 3;
 
 #[derive(Clone, Serialize)]
 pub struct Dim {
@@ -80,7 +95,7 @@ impl CropReport {
 }
 
 /// A `crop=W:H:X:Y` box parsed from cropdetect output.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub struct RawCrop {
     pub w: u32,
     pub h: u32,
@@ -177,6 +192,32 @@ pub fn report_from(id: &str, src: Option<(u32, u32)>, raw: RawCrop) -> CropRepor
     }
 }
 
+/// Whether enough keyframes fill the frame (both bars ≤2%) that the trailer genuinely *uses* the full
+/// frame — more than a stray flash. When true the caller must not crop (mixed-framing trailer): a
+/// dominant letterbox with real full-frame shots. A logo in a bar makes a frame taller-but-not-full,
+/// so it is not counted here — logo cropping is unaffected.
+pub fn uses_full_frame(boxes: &[RawCrop], src: Option<(u32, u32)>) -> bool {
+    let Some((sw, sh)) = src else {
+        return false; // no source dims → can't judge; fall back to the crop path
+    };
+    let full = boxes
+        .iter()
+        .filter(|b| sh.saturating_sub(b.h) * 50 <= sh && sw.saturating_sub(b.w) * 50 <= sw)
+        .count();
+    full >= FULL_FRAME_MIN && full * 100 >= boxes.len() * FULL_FRAME_PCT
+}
+
+/// A "play the full frame" report for `src` — used when a mixed-framing trailer must not be cropped.
+fn full_frame_report(id: &str, sw: u32, sh: u32) -> CropReport {
+    CropReport {
+        id: id.to_string(),
+        source: Some(Dim { w: sw, h: sh }),
+        content: Some(Rect { x: 0, y: 0, w: sw, h: sh }),
+        letterboxed: false,
+        aspect: Some(round2(sw as f64 / sh as f64)),
+    }
+}
+
 /// Nearest standard cinematic aspect to `a`, or `None` if none is within `SNAP_TOL` (relative).
 fn nearest_std_aspect(a: f64) -> Option<f64> {
     STD_ASPECTS
@@ -260,8 +301,14 @@ pub async fn detect(cfg: &Config, id: &str, fp: &Path) -> Option<CropReport> {
         .ok()?
         .ok()?;
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let typical = typical_crop(&parse_all_crops(&stderr))?;
-    Some(refine_report(report_from(id, parse_source_dims(&stderr), typical)))
+    let boxes = parse_all_crops(&stderr);
+    let src = parse_source_dims(&stderr);
+    // Mixed-framing trailer (real full-frame shots) → don't crop, keep bars (see module docs).
+    if let (true, Some((sw, sh))) = (uses_full_frame(&boxes, src), src) {
+        return Some(full_frame_report(id, sw, sh));
+    }
+    let typical = typical_crop(&boxes)?;
+    Some(refine_report(report_from(id, src, typical)))
 }
 
 /// The `clap` box params for a letterboxed report: `(width, height, horizOffNum, vertOffNum)`, each

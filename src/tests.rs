@@ -474,6 +474,29 @@ fn refine_snaps_transient_logo_and_guards_dark_frames() {
 }
 
 #[test]
+fn full_frame_guard_spares_mixed_framing_trailers() {
+    use crate::crop::{uses_full_frame, RawCrop};
+    let src = Some((640u32, 360u32));
+    let lb = RawCrop { w: 640, h: 272, x: 0, y: 44 }; // 2.35 letterbox
+    let full = RawCrop { w: 640, h: 360, x: 0, y: 0 }; // full frame
+
+    // Monsters-vs-Aliens shape: dominant 2.35 letterbox + a few genuine full-frame shots → guard fires,
+    // so the caller keeps the full frame instead of slicing those shots (the v0.3.0 regression).
+    let mut mixed = vec![lb; 60];
+    mixed.extend([full; 3]);
+    mixed.extend([RawCrop { w: 578, h: 272, x: 0, y: 44 }; 2]);
+    assert!(uses_full_frame(&mixed, src), "3 full-frame shots among a letterbox → don't crop");
+
+    // A cleanly letterboxed trailer (no full-frame keyframes) is not spared → it still gets cropped.
+    assert!(!uses_full_frame(&vec![lb; 60], src));
+
+    // A single stray full-frame flash on an otherwise-clean letterbox is below the floor → still crops.
+    let mut flash = vec![lb; 60];
+    flash.push(full);
+    assert!(!uses_full_frame(&flash, src), "one flash shouldn't suppress the crop");
+}
+
+#[test]
 fn parse_source_dims_reads_the_video_stream_line() {
     let stderr = "  Stream #0:0(und): Video: h264 (High) (avc1 / 0x31637661), yuv420p, 1920x1080 [SAR 1:1 DAR 16:9], 24 fps";
     assert_eq!(crate::crop::parse_source_dims(stderr), Some((1920, 1080)));
@@ -554,6 +577,36 @@ async fn clap_pipeline_crops_transient_logo_end_to_end() {
         .output().unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("crop_top=132") && s.contains("crop_bottom=132"), "clap not read back: {s}");
+}
+
+// A mixed-framing trailer (mostly letterboxed + genuine full-frame shots) must NOT be cropped — the
+// full-frame guard keeps the whole frame rather than slicing those shots. Reproduces the real
+// Monsters-vs-Aliens regression. Needs ffmpeg; run locally with: cargo test -- --ignored
+#[tokio::test]
+#[ignore]
+async fn detect_does_not_crop_mixed_framing_end_to_end() {
+    let dir = temp_dir();
+    let fp = dir.join("mixedvid0001.mp4");
+    // 6s of a full-frame testsrc with 131px black bars painted top+bottom (a 2.35 letterbox) — EXCEPT
+    // the last ~1.2s, which is left full-frame (genuine full-frame shots).
+    let ok = std::process::Command::new("ffmpeg")
+        .args([
+            "-y", "-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=24:d=6",
+            "-vf",
+            "drawbox=x=0:y=0:w=1920:h=131:color=black:t=fill:enable='lt(t,4.8)',drawbox=x=0:y=949:w=1920:h=131:color=black:t=fill:enable='lt(t,4.8)'",
+            "-c:v", "libx264", "-g", "6", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        ])
+        .arg(&fp)
+        .status().unwrap().success();
+    assert!(ok, "ffmpeg failed to build the mixed-framing fixture");
+
+    let cfg = test_cfg(dir);
+    let report = crate::crop::detect(&cfg, "mixedvid0001", &fp).await.expect("detect returned a report");
+    // The dominant framing is the 2.35 letterbox, but real full-frame shots are present → play full.
+    assert!(!report.letterboxed, "a trailer with genuine full-frame shots must not be cropped");
+    assert_eq!(report.content.as_ref().unwrap().h, 1080, "full frame kept, not sliced to the letterbox");
+    // And nothing is baked, so an AVPlayer sees the full frame.
+    assert!(!crate::crop::bake_clap(&cfg, &fp, &report).await, "no clap baked for a full-frame report");
 }
 
 #[tokio::test]
