@@ -426,15 +426,51 @@ async fn play_with_range_is_206() {
 // --- cropdetect parsing ---
 
 #[test]
-fn parse_crop_takes_the_last_accumulated_box() {
-    // cropdetect (reset=0) prints progressively wider boxes; the last is the conservative union.
+fn typical_crop_takes_the_modal_box_not_the_union() {
+    // With reset=1 cropdetect prints one box per keyframe. Most keyframes are a clean 1920x816
+    // letterbox; two "logo card" frames read taller. The UNION (old behaviour) would keep the taller
+    // box and leave the bar in; the median keeps the letterbox → the transient logo is cropped away.
     let stderr = "\
-[Parsed_cropdetect_0 @ 0x1] x1:0 x2:1919 y1:140 y2:939 crop=1920:800:0:140\n\
-[Parsed_cropdetect_0 @ 0x1] x1:0 x2:1919 y1:132 y2:947 crop=1920:816:0:132\n";
+[cropdetect] crop=1920:816:0:132\n\
+[cropdetect] crop=1920:816:0:132\n\
+[cropdetect] crop=1920:1060:0:20\n\
+[cropdetect] crop=1920:816:0:132\n\
+[cropdetect] crop=1920:1060:0:20\n\
+[cropdetect] crop=1920:816:0:132\n";
+    let boxes = crate::crop::parse_all_crops(stderr);
+    assert_eq!(boxes.len(), 6);
     assert_eq!(
-        crate::crop::parse_crop(stderr),
+        crate::crop::typical_crop(&boxes),
         Some(crate::crop::RawCrop { w: 1920, h: 816, x: 0, y: 132 })
     );
+}
+
+#[test]
+fn refine_snaps_transient_logo_and_guards_dark_frames() {
+    use crate::crop::{refine_report, report_from, RawCrop};
+    let src = Some((1920, 1080));
+
+    // Already-clean 2.35 letterbox (816): snapping to 2.35 lands on 817 — within the keep-px slop, so
+    // the measured box is left untouched (no 1px jitter).
+    let clean = refine_report(report_from("x", src, RawCrop { w: 1920, h: 816, x: 0, y: 132 }));
+    assert_eq!(clean.content.as_ref().map(|c| (c.w, c.h, c.x, c.y)), Some((1920, 816, 0, 132)));
+    assert!(clean.letterboxed);
+
+    // A logo-inflated box (840, ~2.29:1) is within tolerance of 2.35 and >keep-px off → snapped to a
+    // clean, centred scope crop (1920x817), cropping the logo strip out of the bar.
+    let inflated = refine_report(report_from("x", src, RawCrop { w: 1920, h: 840, x: 0, y: 120 }));
+    assert_eq!(inflated.content.as_ref().map(|c| (c.w, c.h, c.x, c.y)), Some((1920, 817, 0, 131)));
+
+    // A pathological dark-frame box (500px, ~3.84:1 — no standard match, below the 60% floor) is
+    // treated as unsure → not cropped (play the full frame) rather than shave real content.
+    let dark = refine_report(report_from("x", src, RawCrop { w: 1920, h: 500, x: 0, y: 290 }));
+    assert!(!dark.letterboxed);
+    assert_eq!(dark.content.as_ref().map(|c| c.h), Some(1080));
+
+    // A mild non-standard letterbox (738px, ~2.6:1 — no snap, but above the floor) is kept as measured.
+    let mild = refine_report(report_from("x", src, RawCrop { w: 1920, h: 738, x: 0, y: 171 }));
+    assert_eq!(mild.content.as_ref().map(|c| c.h), Some(738));
+    assert!(mild.letterboxed);
 }
 
 #[test]
@@ -477,6 +513,42 @@ async fn clap_pipeline_bakes_box_end_to_end() {
     assert!(crate::crop::bake_clap(&cfg, &fp, &report).await, "MP4Box should write the clap box");
 
     // ffprobe reads the clap back as frame cropping — 132px top & bottom.
+    let out = std::process::Command::new("ffprobe")
+        .args(["-hide_banner", "-v", "error", "-show_streams"]).arg(&fp)
+        .output().unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("crop_top=132") && s.contains("crop_bottom=132"), "clap not read back: {s}");
+}
+
+// Proves the modal detection crops a TRANSIENT logo card out of the bar — not just a clean letterbox.
+// A union over all frames would keep the bar; the median shouldn't. Needs ffmpeg + MP4Box; run locally
+// with: cargo test -- --ignored
+#[tokio::test]
+#[ignore]
+async fn clap_pipeline_crops_transient_logo_end_to_end() {
+    let dir = temp_dir();
+    let fp = dir.join("logovid0001.mp4");
+    // 4s of a 1920x816 letterbox padded to 1080, with a bright "logo" box drawn in the TOP black bar
+    // for the last second only (a minority of keyframes).
+    let ok = std::process::Command::new("ffmpeg")
+        .args([
+            "-y", "-f", "lavfi", "-i", "testsrc=size=1920x816:rate=24:d=4",
+            "-vf",
+            "pad=1920:1080:0:132:color=black,drawbox=x=40:y=20:w=420:h=90:color=white:t=fill:enable='between(t,3,4)'",
+            "-c:v", "libx264", "-g", "6", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        ])
+        .arg(&fp)
+        .status().unwrap().success();
+    assert!(ok, "ffmpeg failed to build the transient-logo fixture");
+
+    let cfg = test_cfg(dir);
+    let report = crate::crop::detect(&cfg, "logovid0001", &fp).await.expect("detect returned a rect");
+    assert!(report.letterboxed, "the dominant frame is a 132px letterbox");
+    // The logo appears in a minority of keyframes, so the typical box is still the 816 letterbox and
+    // the logo is cropped away — a union would have reported a taller box here and kept the bar.
+    assert_eq!(report.content.as_ref().unwrap().h, 816, "a transient logo must not hold the bar open");
+    assert!(crate::crop::bake_clap(&cfg, &fp, &report).await, "MP4Box should write the clap box");
+
     let out = std::process::Command::new("ffprobe")
         .args(["-hide_banner", "-v", "error", "-show_streams"]).arg(&fp)
         .output().unwrap();

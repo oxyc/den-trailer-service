@@ -65,18 +65,21 @@ rectangle; the app aspect-fills that rect instead of the full frame.
   "letterboxed":true, "aspect":2.35 }
 ```
 
-`letterboxed:false` (or a missing `content`) means "play the full frame". It's **logo-safe by
-construction**: cropdetect reports the bounding box of everything non-black, so a logo / laurel /
-"in theaters" card sitting in a bar counts as content — that bar is left in place and the logo is
-never cropped away (worst case a trailer just keeps its bars). `/crop` shares the download with
-`/play` (call it at play time) and caches the result; the `/play` download+serve path is untouched.
+`letterboxed:false` (or a missing `content`) means "play the full frame". cropdetect runs with
+`reset=1` (a fresh box per keyframe), and we crop to the **typical (median) box** snapped to a
+standard cinematic aspect. So a **transient** logo / laurel / "in theaters" card in a bar — present
+on only a minority of keyframes — is **cropped away** rather than holding the bar open; a logo that
+persists for the whole trailer still keeps its bar. A minimum-content floor guards against
+over-cropping a dark trailer (an aggressive, non-standard vertical crop is treated as "unsure" and
+left uncropped). `/crop` shares the download with `/play` (call it at play time) and caches the
+result; the `/play` download+serve path is untouched.
 
 **Baked `clap`.** When a letterbox is detected, den-reel also writes a `clap` (clean aperture) box
 into the cached MP4 (via MP4Box — ~13 ms, +40 bytes, no re-encode, faststart preserved). Apple's
 AVPlayer honors clean aperture, so a direct-to-`AVPlayer` client (Den's billboard trailer) crops
 the bars with **zero client changes** — no `/crop` call needed. Offsets are content-centre-relative,
-so a symmetric letterbox is `0` and an off-centre crop (logo kept in one bar) gets the right
-offset. Clients that ignore `clap` just see the full frame. Set `CLAP=0` to disable baking.
+so the snapped, centred letterbox is `0`. Clients that ignore `clap` just see the full frame. Set
+`CLAP=0` to disable baking.
 
 `/play` failures return a real status + JSON so the caller can say *why*:
 

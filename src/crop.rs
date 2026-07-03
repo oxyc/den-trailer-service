@@ -1,10 +1,12 @@
-//! CROP DETECTION: report the real (non-black) content rectangle of a trailer so the app can
-//! aspect-fill it — trimming baked-in letterbox bars — without any re-encode or quality loss.
+//! CROP DETECTION: report the real content rectangle of a trailer so the app can aspect-fill it —
+//! trimming baked-in letterbox bars — without any re-encode or quality loss.
 //!
-//! We run ffmpeg `cropdetect` over the *cached* MP4 (keyframe-sampled, so it's cheap) and parse the
-//! bounding box of everything non-black. That makes it **logo-safe by construction**: a logo, laurel
-//! or "in theaters" card sitting in the bar is non-black, so cropdetect keeps that region and the
-//! bar is simply left in place for that trailer — we never crop a logo away.
+//! We run ffmpeg `cropdetect` over the *cached* MP4 (keyframe-sampled, so it's cheap) with `reset=1`,
+//! so each keyframe yields its own crop box instead of one growing union. We then take the **typical
+//! (median) box** and snap it to a standard cinematic aspect. That crops a *transient* logo / laurel /
+//! "in theaters" card out of the bar: appearing on only a minority of keyframes, it can't hold the bar
+//! open (a persistent, whole-trailer logo still can). A minimum-content floor guards against
+//! over-cropping a dark trailer whose frames momentarily read as mostly black.
 //!
 //! Exposed as `GET /crop/<id>.json`. Additive; the /play download+serve hot path is untouched — the
 //! (small) cropdetect cost is only paid when the app actually asks, and the result is cached.
@@ -27,6 +29,19 @@ use crate::CROP_CACHE_MAX;
 
 const DETECT_TIMEOUT_SECS: u64 = 60; // cropdetect keyframe pass; backstop a hung ffmpeg
 const BAKE_TIMEOUT_SECS: u64 = 30; // MP4Box clap write is ~instant; backstop a hang
+
+/// Standard cinematic content aspects we snap a detected top/bottom letterbox to, so a logo/laurel
+/// card that inflated a few keyframes' boxes doesn't leave the bar half-cropped — we clap the clean
+/// scope crop instead. (2.39/2.35 scope, 2.0 univisium, 1.85 flat.)
+const STD_ASPECTS: [f64; 4] = [2.39, 2.35, 2.0, 1.85];
+/// Accept a snap only within this *relative* distance of a standard aspect.
+const SNAP_TOL: f64 = 0.05;
+/// If the snapped height is within this many px of the measured typical box, keep the measured box —
+/// don't jitter an already-clean letterbox by a pixel or two.
+const SNAP_KEEP_PX: u32 = 6;
+/// Never crop a top/bottom letterbox below this fraction of the source height. A more aggressive,
+/// non-standard vertical crop is treated as a dark-frame artifact and left uncropped (play full).
+const MIN_CONTENT_FRAC: f64 = 0.6;
 
 #[derive(Clone, Serialize)]
 pub struct Dim {
@@ -73,10 +88,10 @@ pub struct RawCrop {
     pub y: u32,
 }
 
-/// Parse the LAST `crop=W:H:X:Y` cropdetect emits. With `reset=0` cropdetect accumulates, so the
-/// final value is the union bounding box of all non-black pixels seen (the conservative choice).
-pub fn parse_crop(stderr: &str) -> Option<RawCrop> {
-    let mut last = None;
+/// Every `crop=W:H:X:Y` cropdetect emits. With `reset=1` that's one box per analyzed keyframe, so the
+/// set is a distribution we can take a robust typical value from (rather than the growing union).
+pub fn parse_all_crops(stderr: &str) -> Vec<RawCrop> {
+    let mut out = Vec::new();
     for (pos, _) in stderr.match_indices("crop=") {
         let rest = &stderr[pos + 5..];
         let token: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == ':').collect();
@@ -85,11 +100,30 @@ pub fn parse_crop(stderr: &str) -> Option<RawCrop> {
             if let (Ok(w), Ok(h), Ok(x), Ok(y)) =
                 (parts[0].parse(), parts[1].parse(), parts[2].parse(), parts[3].parse())
             {
-                last = Some(RawCrop { w, h, x, y });
+                out.push(RawCrop { w, h, x, y });
             }
         }
     }
-    last
+    out
+}
+
+/// The typical box: the per-field median across all keyframe boxes. Median (not union) is what lets a
+/// transient logo/laurel card — present on a minority of keyframes — fall out, while the dominant
+/// letterbox wins. Each field is taken independently, which is exact for the common centred letterbox.
+pub fn typical_crop(boxes: &[RawCrop]) -> Option<RawCrop> {
+    if boxes.is_empty() {
+        return None;
+    }
+    fn median(mut v: Vec<u32>) -> u32 {
+        v.sort_unstable();
+        v[v.len() / 2]
+    }
+    Some(RawCrop {
+        w: median(boxes.iter().map(|c| c.w).collect()),
+        h: median(boxes.iter().map(|c| c.h).collect()),
+        x: median(boxes.iter().map(|c| c.x).collect()),
+        y: median(boxes.iter().map(|c| c.y).collect()),
+    })
 }
 
 /// Pull the source `WxH` out of ffmpeg's `Stream #… Video:` line.
@@ -143,6 +177,59 @@ pub fn report_from(id: &str, src: Option<(u32, u32)>, raw: RawCrop) -> CropRepor
     }
 }
 
+/// Nearest standard cinematic aspect to `a`, or `None` if none is within `SNAP_TOL` (relative).
+fn nearest_std_aspect(a: f64) -> Option<f64> {
+    STD_ASPECTS
+        .iter()
+        .copied()
+        .min_by(|x, y| (x - a).abs().partial_cmp(&(y - a).abs()).unwrap_or(std::cmp::Ordering::Equal))
+        .filter(|best| (best - a).abs() / best <= SNAP_TOL)
+}
+
+/// Refine a typical-box report for the common (near) full-width top/bottom letterbox: snap the crop to
+/// a standard cinematic aspect (centred, full-width) so a transient logo/laurel card that inflated the
+/// box gets clapped away cleanly, and guard against dark-frame over-crop. Pillarbox / off-width /
+/// already-clean boxes pass through unchanged.
+pub fn refine_report(mut r: CropReport) -> CropReport {
+    if !r.letterboxed {
+        return r;
+    }
+    let (Some(src), Some(c)) = (r.source.clone(), r.content.clone()) else {
+        return r;
+    };
+    let bar_v = src.h.saturating_sub(c.h);
+    let bar_h = src.w.saturating_sub(c.w);
+    // Only the (near) full-width top/bottom letterbox is refined; anything else keeps the measured box.
+    if bar_v <= bar_h || c.w * 20 < src.w * 19 {
+        return r;
+    }
+    match nearest_std_aspect(c.w as f64 / c.h as f64) {
+        Some(snapped) => {
+            let target_h = (src.w as f64 / snapped).round() as u32;
+            // Snap only when it stays on-frame, keeps enough content, and actually moves the box.
+            if target_h <= src.h
+                && target_h as f64 >= src.h as f64 * MIN_CONTENT_FRAC
+                && target_h.abs_diff(c.h) > SNAP_KEEP_PX
+            {
+                let y = (src.h - target_h) / 2;
+                r.aspect = Some(round2(src.w as f64 / target_h as f64));
+                r.letterboxed = src.h.saturating_sub(target_h) * 50 > src.h;
+                r.content = Some(Rect { x: 0, y, w: src.w, h: target_h });
+            }
+            r
+        }
+        // No standard match + an aggressive vertical crop → most likely a dark-frame artifact. Don't
+        // crop (play the full frame) rather than risk shaving real content off a valid trailer.
+        None if (c.h as f64) < src.h as f64 * MIN_CONTENT_FRAC => {
+            r.letterboxed = false;
+            r.aspect = Some(round2(src.w as f64 / src.h as f64));
+            r.content = Some(Rect { x: 0, y: 0, w: src.w, h: src.h });
+            r
+        }
+        None => r,
+    }
+}
+
 /// Run cropdetect over the cached file. Keyframe-sampled (`-skip_frame nokey`) so it's a light
 /// decode-only pass, no encode. `None` if ffmpeg can't be run or emits no usable box.
 pub async fn detect(cfg: &Config, id: &str, fp: &Path) -> Option<CropReport> {
@@ -151,12 +238,14 @@ pub async fn detect(cfg: &Config, id: &str, fp: &Path) -> Option<CropReport> {
         "-hide_banner",
         "-nostdin",
         "-skip_frame",
-        "nokey", // decode only keyframes → fast, still catches held logo cards
+        "nokey", // decode only keyframes → fast
         "-i",
         &fp.to_string_lossy(),
         "-an",
         "-vf",
-        "cropdetect=limit=24:round=2:reset=0",
+        // reset=1: a fresh box per keyframe (not the growing union), so a transient logo card can't
+        // hold the bar open — we take the median box below. (ffmpeg documents reset for exactly this.)
+        "cropdetect=limit=24:round=2:reset=1",
         "-f",
         "null",
         "-",
@@ -171,8 +260,8 @@ pub async fn detect(cfg: &Config, id: &str, fp: &Path) -> Option<CropReport> {
         .ok()?
         .ok()?;
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let raw = parse_crop(&stderr)?;
-    Some(report_from(id, parse_source_dims(&stderr), raw))
+    let typical = typical_crop(&parse_all_crops(&stderr))?;
+    Some(refine_report(report_from(id, parse_source_dims(&stderr), typical)))
 }
 
 /// The `clap` box params for a letterboxed report: `(width, height, horizOffNum, vertOffNum)`, each
