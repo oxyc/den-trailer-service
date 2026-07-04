@@ -19,7 +19,7 @@ use crate::upstream::{HttpUpstream, Upstream};
 use crate::ytdlp::{self, PlayError};
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
-pub type ProbeFn = Box<dyn Fn(String) -> BoxFuture<bool> + Send + Sync>;
+pub type ProbeFn = Box<dyn Fn(String) -> BoxFuture<crate::ytdlp::Probe> + Send + Sync>;
 pub type PrewarmFn = Box<dyn Fn(Arc<AppState>, String) + Send + Sync>;
 pub type ClockFn = Box<dyn Fn() -> u64 + Send + Sync>;
 /// One in-flight download shared across every waiter for the same id (de-dupe).
@@ -92,15 +92,16 @@ impl AppState {
     }
 }
 
-/// Real prober: ask yt-dlp (simulate) whether the id is extractable here, holding a probe permit so
-/// a `/meta` fan-out (and concurrent `/meta`s) can't spawn unbounded yt-dlp processes.
+/// Real prober: ask yt-dlp whether the id is extractable here and (for the resolver's landscape
+/// preference) its orientation, holding a probe permit so a `/meta` fan-out (and concurrent `/meta`s)
+/// can't spawn unbounded yt-dlp processes.
 pub fn default_prober(cfg: Arc<Config>, sem: Arc<Semaphore>) -> ProbeFn {
     Box::new(move |vid: String| {
         let cfg = cfg.clone();
         let sem = sem.clone();
         Box::pin(async move {
             let _permit = sem.acquire().await;
-            ytdlp::probe_extractable(&cfg, &vid).await
+            ytdlp::probe(&cfg, &vid).await
         })
     })
 }

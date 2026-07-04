@@ -86,33 +86,46 @@ pub fn build_meta(ty: &str, imdb: &str, base: &str, yt_id: &str) -> Value {
     })
 }
 
-/// First candidate yt-dlp can actually extract here, preserving rank order. The common case (top
-/// trailer plays) costs ONE probe; only on a miss do we probe the rest concurrently and take the
-/// highest-ranked that passes — so a geo-blocked top pick no longer serialises N×3s.
+/// The best trailer yt-dlp can extract here: the highest-ranked **landscape** playable, falling back
+/// to the highest-ranked playable of any orientation only if nothing landscape is playable. Preferring
+/// landscape keeps a portrait trailer (which plays as a tall sliver on the landscape billboard) from
+/// being served when a landscape one exists. The common case (top trailer plays and is landscape)
+/// still costs ONE probe; only a portrait/blocked top pick fans the rest out concurrently.
 async fn first_playable(state: &Arc<AppState>, candidates: &[String]) -> String {
+    use crate::ytdlp::Probe;
     if candidates.is_empty() {
         return String::new();
     }
-    if (state.prober)(candidates[0].clone()).await {
+    let p0 = (state.prober)(candidates[0].clone()).await;
+    if matches!(p0, Probe::Playable { landscape: true }) {
         return candidates[0].clone();
     }
+    // Top is portrait or unplayable — remember a playable-but-portrait top as the last-resort fallback,
+    // then probe the rest concurrently for a landscape one.
+    let mut fallback = matches!(p0, Probe::Playable { .. }).then_some(0usize);
     let rest = &candidates[1..];
-    // Spawn so the probes actually run concurrently (futures are lazy)...
     let mut handles: Vec<_> = rest
         .iter()
         .map(|c| tokio::spawn((state.prober)(c.clone())))
         .collect();
     for i in 0..handles.len() {
-        if (&mut handles[i]).await.unwrap_or(false) {
-            // ...but await in rank order → highest-ranked winner. Cancel the probes we no longer
-            // need (their yt-dlp --simulate processes die with the task via kill_on_drop).
-            for h in &handles[i + 1..] {
-                h.abort();
+        match (&mut handles[i]).await.unwrap_or(Probe::Unplayable) {
+            // Await in rank order → first landscape hit is the highest-ranked one. Cancel the rest
+            // (their yt-dlp processes die with the task via kill_on_drop).
+            Probe::Playable { landscape: true } => {
+                for h in &handles[i + 1..] {
+                    h.abort();
+                }
+                return rest[i].clone();
             }
-            return rest[i].clone();
+            // Highest-ranked portrait becomes the fallback if the top wasn't already one.
+            Probe::Playable { landscape: false } => {
+                fallback.get_or_insert(i + 1);
+            }
+            Probe::Unplayable => continue,
         }
     }
-    String::new()
+    fallback.map(|i| candidates[i].clone()).unwrap_or_default()
 }
 
 /// Resolve (and cache) the first PLAYABLE trailer ytId for an imdb id. "" = looked up, nothing

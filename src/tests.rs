@@ -87,7 +87,7 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
 }
 
 fn always_playable() -> ProbeFn {
-    Box::new(|_id| Box::pin(async { true }))
+    Box::new(|_id| Box::pin(async { crate::ytdlp::Probe::Playable { landscape: true } }))
 }
 fn noop_prewarm() -> PrewarmFn {
     Box::new(|_state, _id| {})
@@ -220,8 +220,13 @@ async fn resolve_returns_first_playable_and_caches() {
 
 #[tokio::test]
 async fn resolve_skips_geoblocked_and_falls_back() {
+    use crate::ytdlp::Probe;
     let fake = FakeUpstream::new(&["blockedUS01", "worldwide22"], None);
-    let prober: ProbeFn = Box::new(|id| Box::pin(async move { id != "blockedUS01" }));
+    let prober: ProbeFn = Box::new(|id| {
+        Box::pin(async move {
+            if id == "blockedUS01" { Probe::Unplayable } else { Probe::Playable { landscape: true } }
+        })
+    });
     let state = build_state(temp_dir(), Box::new(fake), prober, noop_prewarm());
     assert_eq!(crate::addon::resolve_youtube_id(&state, "test-key", None, "tt0111161", "movie", "en").await, "worldwide22");
 }
@@ -229,9 +234,42 @@ async fn resolve_skips_geoblocked_and_falls_back() {
 #[tokio::test]
 async fn resolve_returns_empty_when_none_playable() {
     let fake = FakeUpstream::new(&["blockedUS01"], None);
-    let prober: ProbeFn = Box::new(|_id| Box::pin(async { false }));
+    let prober: ProbeFn = Box::new(|_id| Box::pin(async { crate::ytdlp::Probe::Unplayable }));
     let state = build_state(temp_dir(), Box::new(fake), prober, noop_prewarm());
     assert_eq!(crate::addon::resolve_youtube_id(&state, "test-key", None, "tt0111161", "movie", "en").await, "");
+}
+
+#[tokio::test]
+async fn resolve_prefers_landscape_over_a_higher_ranked_portrait() {
+    use crate::ytdlp::Probe;
+    // Top candidate is a playable PORTRAIT trailer; a lower-ranked one is landscape. We should serve
+    // the landscape one (a portrait trailer plays as a tall sliver on the landscape billboard).
+    let fake = FakeUpstream::new(&["portraitTop", "landscape02"], None);
+    let prober: ProbeFn = Box::new(|id| {
+        Box::pin(async move { Probe::Playable { landscape: id != "portraitTop" } })
+    });
+    let state = build_state(temp_dir(), Box::new(fake), prober, noop_prewarm());
+    assert_eq!(crate::addon::resolve_youtube_id(&state, "test-key", None, "tt0111161", "movie", "en").await, "landscape02");
+}
+
+#[tokio::test]
+async fn resolve_falls_back_to_portrait_when_no_landscape_playable() {
+    use crate::ytdlp::Probe;
+    // Only portrait trailers are playable → serve the highest-ranked one rather than nothing.
+    let fake = FakeUpstream::new(&["portraitTop", "portrait02"], None);
+    let prober: ProbeFn = Box::new(|_id| Box::pin(async { Probe::Playable { landscape: false } }));
+    let state = build_state(temp_dir(), Box::new(fake), prober, noop_prewarm());
+    assert_eq!(crate::addon::resolve_youtube_id(&state, "test-key", None, "tt0111161", "movie", "en").await, "portraitTop");
+}
+
+#[test]
+fn parse_landscape_reads_dims_and_defaults_safely() {
+    use crate::ytdlp::parse_landscape;
+    assert!(parse_landscape("1920 1080"), "wide → landscape");
+    assert!(parse_landscape("1080 1080"), "square counts as landscape (not a sliver)");
+    assert!(!parse_landscape("1080 1920"), "tall → portrait");
+    assert!(parse_landscape("NA NA"), "unknown dims default to landscape (don't skip)");
+    assert!(parse_landscape(""), "empty output defaults to landscape");
 }
 
 // --- HTTP contract ----------------------------------------------------------

@@ -83,13 +83,25 @@ fn watch_url(vid: &str) -> String {
 }
 
 /// Does yt-dlp think this id is extractable HERE (right region, decodable formats)? Fast:
-/// `--simulate`, no download. Any spawn/exec error counts as "not extractable".
-pub async fn probe_extractable(cfg: &Config, vid: &str) -> bool {
+/// Outcome of probing a candidate without downloading: whether yt-dlp can extract it here, and (when
+/// known) whether it's landscape. So the resolver can prefer a landscape trailer over a portrait one —
+/// a portrait trailer plays as a tall sliver on the landscape billboard. Unknown dimensions default to
+/// landscape, so we never skip a good trailer over missing metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Probe {
+    Unplayable,
+    Playable { landscape: bool },
+}
+
+/// `--print` the selected format's dimensions (implies `--simulate`, so no download) — this both
+/// validates extractability (exit 0 ⇔ the format resolves here, same as the old `--simulate`) and
+/// yields orientation. Any spawn/exec error, non-zero exit, or timeout → `Unplayable`; exit 0 with
+/// unparsable/missing dims → `Playable { landscape: true }` (don't penalise a good trailer).
+pub async fn probe(cfg: &Config, vid: &str) -> Probe {
     let cache = cfg.ytdlp_cache.to_string_lossy().into_owned();
     let mut cmd = Command::new(&cfg.ytdlp);
     cmd.args([
         "-q",
-        "--simulate",
         "--no-warnings",
         "--socket-timeout",
         "15",
@@ -97,17 +109,32 @@ pub async fn probe_extractable(cfg: &Config, vid: &str) -> bool {
         &cache,
         "-f",
         &cfg.ytdlp_format,
+        "--print",
+        "%(width)s %(height)s",
         &watch_url(vid),
     ])
     .stdin(Stdio::null())
-    .stdout(Stdio::null())
+    .stdout(Stdio::piped())
     .stderr(Stdio::null())
     .kill_on_drop(true); // cancelled/timed-out probe kills its yt-dlp too
-    // Timeout backstop: on elapse the status future is dropped → kill_on_drop reaps → "not playable".
-    matches!(
-        tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), cmd.status()).await,
-        Ok(Ok(s)) if s.success()
-    )
+    // Timeout backstop: on elapse the output future is dropped → kill_on_drop reaps → "unplayable".
+    let out = match tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), cmd.output()).await {
+        Ok(Ok(o)) if o.status.success() => o,
+        _ => return Probe::Unplayable,
+    };
+    Probe::Playable { landscape: parse_landscape(&String::from_utf8_lossy(&out.stdout)) }
+}
+
+/// Parse yt-dlp's `"W H"` print → is it landscape (`w >= h`)? Missing/unparsable dims → `true`.
+pub fn parse_landscape(s: &str) -> bool {
+    let mut it = s.split_whitespace();
+    match (
+        it.next().and_then(|w| w.parse::<u32>().ok()),
+        it.next().and_then(|h| h.parse::<u32>().ok()),
+    ) {
+        (Some(w), Some(h)) => w >= h,
+        _ => true,
+    }
 }
 
 /// Run yt-dlp+ffmpeg to produce a faststart MP4 at `tmp`. Returns `Ok` iff the process exited 0 and
