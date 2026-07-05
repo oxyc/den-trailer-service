@@ -174,6 +174,46 @@ async fn probe_extractable(cfg: &Config, vid: &str) -> bool {
     )
 }
 
+/// YouTube-search fallback: `yt-dlp "ytsearchN:<query>"` → up to `n` video ids (flat, no per-video
+/// extraction, no download). Used when TMDB/KinoCheck carry no trailer for a title; the ids are then
+/// probed like any other candidate. Empty on any error (logged, never swallowed).
+pub async fn search(cfg: &Config, query: &str, n: usize) -> Vec<String> {
+    let mut cmd = Command::new(&cfg.ytdlp);
+    cmd.args([
+        "-q",
+        "--no-warnings",
+        "--flat-playlist",
+        "--socket-timeout",
+        "15",
+        "--print",
+        "id",
+        &format!("ytsearch{n}:{query}"),
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
+    match tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), cmd.output()).await {
+        Ok(Ok(o)) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+        Ok(Ok(o)) => {
+            eprintln!("search {query:?}: yt-dlp exit {:?} — {}", o.status.code(), stderr_tail(&o.stderr));
+            Vec::new()
+        }
+        Ok(Err(e)) => {
+            eprintln!("search {query:?}: yt-dlp spawn error — {e}");
+            Vec::new()
+        }
+        Err(_) => {
+            eprintln!("search {query:?}: timed out after {PROBE_TIMEOUT_SECS}s");
+            Vec::new()
+        }
+    }
+}
+
 /// Last ~200 chars of stderr on one line, for a compact diagnostic log.
 fn stderr_tail(stderr: &[u8]) -> String {
     let s = String::from_utf8_lossy(stderr);

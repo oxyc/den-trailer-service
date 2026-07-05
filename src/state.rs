@@ -20,6 +20,8 @@ use crate::ytdlp::{self, PlayError};
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 pub type ProbeFn = Box<dyn Fn(String) -> BoxFuture<crate::ytdlp::Probe> + Send + Sync>;
+/// YouTube-search fallback: query → candidate video ids. Injectable so tests stay hermetic.
+pub type SearchFn = Box<dyn Fn(String) -> BoxFuture<Vec<String>> + Send + Sync>;
 pub type PrewarmFn = Box<dyn Fn(Arc<AppState>, String) + Send + Sync>;
 pub type ClockFn = Box<dyn Fn() -> u64 + Send + Sync>;
 /// One in-flight download shared across every waiter for the same id (de-dupe).
@@ -48,6 +50,8 @@ pub struct AppState {
     pub crop_cache: Mutex<HashMap<String, crate::crop::CropReport>>,
     pub upstream: Box<dyn Upstream>,
     pub prober: ProbeFn,
+    /// YouTube-search fallback (fires only when TMDB/KinoCheck carry no trailer).
+    pub searcher: SearchFn,
     pub prewarm: PrewarmFn,
     pub clock: ClockFn,
     /// Global caps on concurrent subprocess trees, so a burst of distinct ids can't fork-bomb the
@@ -83,7 +87,8 @@ impl AppState {
             dl_gen: AtomicU64::new(0),
             crop_cache: Mutex::new(HashMap::new()),
             upstream,
-            prober: default_prober(cfg, probe_sem.clone()),
+            prober: default_prober(cfg.clone(), probe_sem.clone()),
+            searcher: default_searcher(cfg, probe_sem.clone()),
             prewarm: default_prewarm(),
             clock: Box::new(default_clock),
             download_sem: Arc::new(Semaphore::new(crate::DOWNLOAD_CONCURRENCY)),
@@ -102,6 +107,19 @@ pub fn default_prober(cfg: Arc<Config>, sem: Arc<Semaphore>) -> ProbeFn {
         Box::pin(async move {
             let _permit = sem.acquire().await;
             ytdlp::probe(&cfg, &vid).await
+        })
+    })
+}
+
+/// Real searcher: `yt-dlp ytsearch` for a query, holding a probe permit (searches are as heavy as
+/// probes) so a fallback can't spawn unbounded yt-dlp processes.
+pub fn default_searcher(cfg: Arc<Config>, sem: Arc<Semaphore>) -> SearchFn {
+    Box::new(move |query: String| {
+        let cfg = cfg.clone();
+        let sem = sem.clone();
+        Box::pin(async move {
+            let _permit = sem.acquire().await;
+            ytdlp::search(&cfg, &query, crate::SEARCH_MAX).await
         })
     })
 }

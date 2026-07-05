@@ -22,6 +22,9 @@ pub trait Upstream: Send + Sync {
     /// env fallback during migration) — resolved by the caller so the upstream holds no key of its own.
     async fn tmdb_candidates(&self, tmdb_key: &str, imdb: &str, ty: &str, lang: &str) -> Vec<String>;
     async fn kinocheck_youtube_id(&self, kinocheck_key: Option<&str>, imdb: &str, ty: &str, lang: &str) -> Option<String>;
+    /// imdb → the title (+ year, e.g. "Backrooms 2025") for a YouTube-search fallback query, or None on
+    /// miss. Used only when TMDB/KinoCheck carry no trailer for the title.
+    async fn tmdb_title(&self, tmdb_key: &str, imdb: &str, ty: &str) -> Option<String>;
     /// Consecutive hard upstream faults, for /health (ADDON-02). Non-HTTP upstreams report 0.
     fn recent_failures(&self) -> u32 {
         0
@@ -157,6 +160,38 @@ impl Upstream for HttpUpstream {
         let empty = Vec::new();
         let results = data["results"].as_array().unwrap_or(&empty);
         pick_trailer_candidates(results)
+    }
+
+    /// imdb → "Title Year" via TMDB /find, for the YouTube-search fallback query. None on miss.
+    async fn tmdb_title(&self, tmdb_key: &str, imdb: &str, ty: &str) -> Option<String> {
+        if tmdb_key.is_empty() {
+            return None;
+        }
+        let tmdb_type = if ty == "series" { "tv" } else { "movie" };
+        let find_url = format!(
+            "{}/find/{imdb}?external_source=imdb_id&api_key={tmdb_key}",
+            self.cfg.tmdb_base
+        );
+        let found = self.get_json(&find_url, &[]).await?;
+        let hit = if tmdb_type == "movie" {
+            found["movie_results"].get(0)?
+        } else {
+            found["tv_results"].get(0)?
+        };
+        // Movies carry `title` + `release_date`; TV carries `name` + `first_air_date`.
+        let title = hit["title"].as_str().or_else(|| hit["name"].as_str())?.trim();
+        if title.is_empty() {
+            return None;
+        }
+        let year = hit["release_date"]
+            .as_str()
+            .or_else(|| hit["first_air_date"].as_str())
+            .and_then(|d| d.get(0..4))
+            .filter(|y| y.len() == 4);
+        Some(match year {
+            Some(y) => format!("{title} {y}"),
+            None => title.to_string(),
+        })
     }
 
     /// KinoCheck discovery fallback: imdb → official trailer's YouTube id (or None).

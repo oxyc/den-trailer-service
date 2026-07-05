@@ -23,6 +23,7 @@ use crate::ytdlp::classify;
 struct FakeInner {
     tmdb: Mutex<Vec<String>>,
     kc: Mutex<Option<String>>,
+    title: Mutex<Option<String>>,
     calls: AtomicUsize,
 }
 
@@ -34,11 +35,15 @@ impl FakeUpstream {
         FakeUpstream(Arc::new(FakeInner {
             tmdb: Mutex::new(tmdb.iter().map(|s| s.to_string()).collect()),
             kc: Mutex::new(kc.map(|s| s.to_string())),
+            title: Mutex::new(None),
             calls: AtomicUsize::new(0),
         }))
     }
     fn set_tmdb(&self, tmdb: &[&str]) {
         *self.0.tmdb.lock().unwrap() = tmdb.iter().map(|s| s.to_string()).collect();
+    }
+    fn set_title(&self, title: &str) {
+        *self.0.title.lock().unwrap() = Some(title.to_string());
     }
     fn calls(&self) -> usize {
         self.0.calls.load(Ordering::SeqCst)
@@ -53,6 +58,9 @@ impl Upstream for FakeUpstream {
     }
     async fn kinocheck_youtube_id(&self, _kinocheck_key: Option<&str>, _imdb: &str, _ty: &str, _lang: &str) -> Option<String> {
         self.0.kc.lock().unwrap().clone()
+    }
+    async fn tmdb_title(&self, _tmdb_key: &str, _imdb: &str, _ty: &str) -> Option<String> {
+        self.0.title.lock().unwrap().clone()
     }
 }
 
@@ -93,6 +101,11 @@ fn noop_prewarm() -> PrewarmFn {
     Box::new(|_state, _id| {})
 }
 
+/// The search fallback never fires in most tests (mock `tmdb_title` is None); a no-op keeps them hermetic.
+fn noop_searcher() -> crate::state::SearchFn {
+    Box::new(|_q| Box::pin(async { Vec::<String>::new() }))
+}
+
 fn build_state(cache_dir: PathBuf, upstream: Box<dyn Upstream>, prober: ProbeFn, prewarm: PrewarmFn) -> Arc<AppState> {
     build_state_cfg(test_cfg(cache_dir), upstream, prober, prewarm)
 }
@@ -100,6 +113,17 @@ fn build_state(cache_dir: PathBuf, upstream: Box<dyn Upstream>, prober: ProbeFn,
 /// Like `build_state` but with an explicit `Config` — lets a test enable the sealed-config keyring
 /// (via `config_key`) exactly the way production does.
 fn build_state_cfg(cfg: Config, upstream: Box<dyn Upstream>, prober: ProbeFn, prewarm: PrewarmFn) -> Arc<AppState> {
+    build_state_full(cfg, upstream, prober, prewarm, noop_searcher())
+}
+
+/// Full builder with an injectable searcher (only the search-fallback test needs a non-noop one).
+fn build_state_full(
+    cfg: Config,
+    upstream: Box<dyn Upstream>,
+    prober: ProbeFn,
+    prewarm: PrewarmFn,
+    searcher: crate::state::SearchFn,
+) -> Arc<AppState> {
     let config_keyring = crate::seal::Keyring::from_env(&cfg.config_key, &cfg.config_keys_prev).unwrap();
     Arc::new(AppState {
         cfg: Arc::new(cfg),
@@ -110,6 +134,7 @@ fn build_state_cfg(cfg: Config, upstream: Box<dyn Upstream>, prober: ProbeFn, pr
         crop_cache: Mutex::new(HashMap::new()),
         upstream,
         prober,
+        searcher,
         prewarm,
         clock: Box::new(default_clock),
         download_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::DOWNLOAD_CONCURRENCY)),
@@ -237,6 +262,35 @@ async fn resolve_returns_empty_when_none_playable() {
     let prober: ProbeFn = Box::new(|_id| Box::pin(async { crate::ytdlp::Probe::Unplayable }));
     let state = build_state(temp_dir(), Box::new(fake), prober, noop_prewarm());
     assert_eq!(crate::addon::resolve_youtube_id(&state, "test-key", None, "tt0111161", "movie", "en").await, "");
+}
+
+#[tokio::test]
+async fn resolve_falls_back_to_youtube_search_when_no_candidates() {
+    use crate::ytdlp::Probe;
+    // TMDB + KinoCheck carry no trailer, but the title is known → search YouTube and probe the results.
+    let fake = FakeUpstream::new(&[], None);
+    fake.set_title("Backrooms 2025");
+    let prober: ProbeFn = Box::new(|id| {
+        Box::pin(async move {
+            if id == "searchHit01" { Probe::Playable { landscape: true } } else { Probe::Unplayable }
+        })
+    });
+    let searcher: crate::state::SearchFn =
+        Box::new(|_q| Box::pin(async { vec!["searchMiss".into(), "searchHit01".into()] }));
+    let state = build_state_full(test_cfg(temp_dir()), Box::new(fake), prober, noop_prewarm(), searcher);
+    let id = crate::addon::resolve_youtube_id(&state, "test-key", None, "tt99999999", "movie", "en").await;
+    assert_eq!(id, "searchHit01");
+}
+
+#[tokio::test]
+async fn resolve_no_search_when_title_unknown() {
+    // No candidates AND no title → the search fallback can't build a query → empty, no panic.
+    let fake = FakeUpstream::new(&[], None); // title left None
+    let prober: ProbeFn = Box::new(|_id| Box::pin(async { crate::ytdlp::Probe::Playable { landscape: true } }));
+    let searcher: crate::state::SearchFn =
+        Box::new(|_q| Box::pin(async { vec!["shouldNotBeUsed".into()] }));
+    let state = build_state_full(test_cfg(temp_dir()), Box::new(fake), prober, noop_prewarm(), searcher);
+    assert_eq!(crate::addon::resolve_youtube_id(&state, "test-key", None, "tt0", "movie", "en").await, "");
 }
 
 #[tokio::test]

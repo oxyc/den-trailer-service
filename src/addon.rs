@@ -163,14 +163,36 @@ pub async fn resolve_youtube_id(
         }
     }
     candidates.truncate(MAX_PROBE);
-    let id = first_playable(state, &candidates).await;
-    // Surface the two distinct "no trailer" causes so an outage isn't a silent empty (never swallow):
-    // zero candidates = TMDB/KinoCheck had nothing; candidates-but-empty = none extractable here.
+    let mut id = first_playable(state, &candidates).await;
+    // Fallback: TMDB/KinoCheck gave no playable trailer (a brand-new title TMDB hasn't linked a video
+    // for, or all its candidates unplayable here) → search YouTube for "<title year> trailer" and probe
+    // those. Only fires on a miss, so the common path is unchanged.
+    if id.is_empty() {
+        if let Some(title) = state.upstream.tmdb_title(tmdb_key, imdb, ty).await {
+            let query = format!("{title} trailer");
+            let found = (state.searcher)(query.clone()).await;
+            let mut search_cands: Vec<String> = Vec::new();
+            for c in found {
+                if seen.insert(c.clone()) {
+                    search_cands.push(c);
+                }
+            }
+            if !search_cands.is_empty() {
+                id = first_playable(state, &search_cands).await;
+                eprintln!(
+                    "trailer {imdb} ({ty}/{lang}): search {query:?} → {} result(s), playable={}",
+                    search_cands.len(),
+                    !id.is_empty()
+                );
+            }
+        }
+    }
+    // Surface the "no trailer" causes so an outage isn't a silent empty (never swallow).
     if id.is_empty() {
         if candidates.is_empty() {
-            eprintln!("trailer {imdb} ({ty}/{lang}): no candidates from TMDB/KinoCheck");
+            eprintln!("trailer {imdb} ({ty}/{lang}): no TMDB/KinoCheck candidates + search found nothing playable");
         } else {
-            eprintln!("trailer {imdb} ({ty}/{lang}): {} candidate(s) but none playable here", candidates.len());
+            eprintln!("trailer {imdb} ({ty}/{lang}): {} candidate(s) + search, none playable here", candidates.len());
         }
     }
     let ttl = if id.is_empty() { YT_NEG_TTL_MS } else { YT_TTL_MS };

@@ -39,6 +39,7 @@ use crate::state::AppState;
 use std::sync::Arc;
 
 pub const MAX_PROBE: usize = 6; // cap how many trailer candidates we validate per movie
+pub const SEARCH_MAX: usize = 4; // YouTube-search fallback: how many results to consider (then probe)
 pub const PREWARM_MAX: usize = 3; // cap concurrent prewarm downloads (bounds a burst of /meta calls)
 pub const YT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 pub const YT_NEG_TTL_MS: u64 = 60 * 60 * 1000; // "nothing playable" caches shorter (geo/transient may lift)
