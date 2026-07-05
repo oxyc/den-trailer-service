@@ -115,14 +115,70 @@ pub async fn probe(cfg: &Config, vid: &str) -> Probe {
     ])
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
-    .stderr(Stdio::null())
+    .stderr(Stdio::piped()) // capture, never swallow — a silent probe error hid a total-outage regression
     .kill_on_drop(true); // cancelled/timed-out probe kills its yt-dlp too
-    // Timeout backstop: on elapse the output future is dropped → kill_on_drop reaps → "unplayable".
-    let out = match tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), cmd.output()).await {
-        Ok(Ok(o)) if o.status.success() => o,
-        _ => return Probe::Unplayable,
-    };
-    Probe::Playable { landscape: parse_landscape(&String::from_utf8_lossy(&out.stdout)) }
+    // Timeout backstop: on elapse the output future is dropped → kill_on_drop reaps.
+    match tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), cmd.output()).await {
+        Ok(Ok(o)) if o.status.success() => {
+            Probe::Playable { landscape: parse_landscape(&String::from_utf8_lossy(&o.stdout)) }
+        }
+        Ok(Ok(o)) => {
+            // Non-zero exit. Surface WHY (was swallowed), then fall back to the proven plain
+            // `--simulate` extractability gate: if yt-dlp can still extract the title, serve it (unknown
+            // orientation → landscape) rather than dropping a good trailer over a `--print`/format quirk.
+            // Only a genuine failure (geo-block, removed, bot-check) fails both → Unplayable.
+            eprintln!("probe {vid}: --print exit {:?} — {}", o.status.code(), stderr_tail(&o.stderr));
+            if probe_extractable(cfg, vid).await {
+                eprintln!("probe {vid}: extractable via --simulate → serving (orientation unknown → landscape)");
+                Probe::Playable { landscape: true }
+            } else {
+                Probe::Unplayable
+            }
+        }
+        Ok(Err(e)) => {
+            eprintln!("probe {vid}: yt-dlp spawn error — {e}");
+            Probe::Unplayable
+        }
+        Err(_) => {
+            eprintln!("probe {vid}: timed out after {PROBE_TIMEOUT_SECS}s");
+            Probe::Unplayable
+        }
+    }
+}
+
+/// The proven extractability gate (pre-0.3.2): `--simulate`, exit 0 ⇔ yt-dlp can extract the selected
+/// format here. Used as the safety net when the richer `--print` probe fails, so a `--print`/dimension
+/// quirk can't drop an otherwise-playable trailer.
+async fn probe_extractable(cfg: &Config, vid: &str) -> bool {
+    let cache = cfg.ytdlp_cache.to_string_lossy().into_owned();
+    let mut cmd = Command::new(&cfg.ytdlp);
+    cmd.args([
+        "-q",
+        "--simulate",
+        "--no-warnings",
+        "--socket-timeout",
+        "15",
+        "--cache-dir",
+        &cache,
+        "-f",
+        &cfg.ytdlp_format,
+        &watch_url(vid),
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .kill_on_drop(true);
+    matches!(
+        tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), cmd.status()).await,
+        Ok(Ok(s)) if s.success()
+    )
+}
+
+/// Last ~200 chars of stderr on one line, for a compact diagnostic log.
+fn stderr_tail(stderr: &[u8]) -> String {
+    let s = String::from_utf8_lossy(stderr);
+    let tail: String = s.chars().rev().take(200).collect::<Vec<_>>().into_iter().rev().collect();
+    tail.replace('\n', " ").trim().to_string()
 }
 
 /// Parse yt-dlp's `"W H"` print → is it landscape (`w >= h`)? Missing/unparsable dims → `true`.

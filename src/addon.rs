@@ -164,6 +164,15 @@ pub async fn resolve_youtube_id(
     }
     candidates.truncate(MAX_PROBE);
     let id = first_playable(state, &candidates).await;
+    // Surface the two distinct "no trailer" causes so an outage isn't a silent empty (never swallow):
+    // zero candidates = TMDB/KinoCheck had nothing; candidates-but-empty = none extractable here.
+    if id.is_empty() {
+        if candidates.is_empty() {
+            eprintln!("trailer {imdb} ({ty}/{lang}): no candidates from TMDB/KinoCheck");
+        } else {
+            eprintln!("trailer {imdb} ({ty}/{lang}): {} candidate(s) but none playable here", candidates.len());
+        }
+    }
     let ttl = if id.is_empty() { YT_NEG_TTL_MS } else { YT_TTL_MS };
     {
         let mut cache = state.yt_cache.lock().unwrap_or_else(|e| e.into_inner());
