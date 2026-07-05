@@ -66,24 +66,22 @@ fn is_sane_host(h: &str) -> bool {
         && h.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'_'))
 }
 
-/// Build the Fusion `meta` payload for a resolved (or missing) trailer.
-pub fn build_meta(ty: &str, imdb: &str, base: &str, yt_id: &str) -> Value {
-    if yt_id.is_empty() {
-        return json!({ "meta": { "id": imdb, "type": ty, "links": [] } });
-    }
-    let trailers = format!("{}/play/{yt_id}.mp4", base.trim_end_matches('/'));
-    json!({
-        "meta": {
-            "id": imdb,
-            "type": ty,
-            "links": [{
+/// Build the Fusion `meta` payload — one `links[]` entry per resolved trailer, best-first, so the client
+/// can fall back to the next on a playback failure. Empty ids → no links.
+pub fn build_meta(ty: &str, imdb: &str, base: &str, yt_ids: &[String]) -> Value {
+    let base = base.trim_end_matches('/');
+    let links: Vec<Value> = yt_ids
+        .iter()
+        .map(|id| {
+            json!({
                 "name": "Trailer",
                 "category": "Trailer",
-                "trailers": trailers,
+                "trailers": format!("{base}/play/{id}.mp4"),
                 "provider": "Den Reel",
-            }],
-        }
-    })
+            })
+        })
+        .collect();
+    json!({ "meta": { "id": imdb, "type": ty, "links": links } })
 }
 
 /// The best trailer yt-dlp can extract here: the highest-ranked **landscape** playable, falling back
@@ -128,24 +126,25 @@ async fn first_playable(state: &Arc<AppState>, candidates: &[String]) -> String 
     fallback.map(|i| candidates[i].clone()).unwrap_or_default()
 }
 
-/// Resolve (and cache) the first PLAYABLE trailer ytId for an imdb id. "" = looked up, nothing
-/// playable (cached shorter, in case it's transient). `tmdb_key`/`kinocheck_key` are the effective
+/// Resolve (and cache) trailer ytIds for an imdb id, **best-playable first** then the remaining
+/// candidates as unprobed fallbacks (so the client can try the next on a playback failure). Empty =
+/// nothing playable (cached shorter, in case transient). `tmdb_key`/`kinocheck_key` are the effective
 /// per-request BYOK credentials (URL config, or env fallback). The cache is keyed by `imdb:lang` only —
 /// the resolved trailer is public and key-independent, so installs with different keys share one entry.
-pub async fn resolve_youtube_id(
+pub async fn resolve_youtube_ids(
     state: &Arc<AppState>,
     tmdb_key: &str,
     kinocheck_key: Option<&str>,
     imdb: &str,
     ty: &str,
     lang: &str,
-) -> String {
+) -> Vec<String> {
     let cache_key = format!("{imdb}:{lang}");
     {
         let cache = state.yt_cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(e) = cache.get(&cache_key) {
             if e.exp > (state.clock)() {
-                return e.id.clone();
+                return e.ids.clone();
             }
         }
     }
@@ -163,11 +162,13 @@ pub async fn resolve_youtube_id(
         }
     }
     candidates.truncate(MAX_PROBE);
-    let mut id = first_playable(state, &candidates).await;
+    // The best-playable pick + the pool it came from (the pool's other members become fallbacks).
+    let mut primary = first_playable(state, &candidates).await;
+    let mut pool = candidates.clone();
     // Fallback: TMDB/KinoCheck gave no playable trailer (a brand-new title TMDB hasn't linked a video
     // for, or all its candidates unplayable here) → search YouTube for "<title year> trailer" and probe
     // those. Only fires on a miss, so the common path is unchanged.
-    if id.is_empty() {
+    if primary.is_empty() {
         if let Some(title) = state.upstream.tmdb_title(tmdb_key, imdb, ty).await {
             let query = format!("{title} trailer");
             let found = (state.searcher)(query.clone()).await;
@@ -178,24 +179,35 @@ pub async fn resolve_youtube_id(
                 }
             }
             if !search_cands.is_empty() {
-                id = first_playable(state, &search_cands).await;
+                primary = first_playable(state, &search_cands).await;
+                pool = search_cands;
                 eprintln!(
                     "trailer {imdb} ({ty}/{lang}): search {query:?} → {} result(s), playable={}",
-                    search_cands.len(),
-                    !id.is_empty()
+                    pool.len(),
+                    !primary.is_empty()
                 );
             }
         }
     }
+    // Ordered result: the probed-playable pick first, then its pool's other members as unprobed
+    // fallbacks (no extra probing — the client only tries them if the first fails to play).
+    let ids: Vec<String> = if primary.is_empty() {
+        Vec::new()
+    } else {
+        let mut out = vec![primary.clone()];
+        out.extend(pool.into_iter().filter(|c| *c != primary));
+        out.truncate(MAX_PROBE);
+        out
+    };
     // Surface the "no trailer" causes so an outage isn't a silent empty (never swallow).
-    if id.is_empty() {
+    if ids.is_empty() {
         if candidates.is_empty() {
             eprintln!("trailer {imdb} ({ty}/{lang}): no TMDB/KinoCheck candidates + search found nothing playable");
         } else {
             eprintln!("trailer {imdb} ({ty}/{lang}): {} candidate(s) + search, none playable here", candidates.len());
         }
     }
-    let ttl = if id.is_empty() { YT_NEG_TTL_MS } else { YT_TTL_MS };
+    let ttl = if ids.is_empty() { YT_NEG_TTL_MS } else { YT_TTL_MS };
     {
         let mut cache = state.yt_cache.lock().unwrap_or_else(|e| e.into_inner());
         // Bound growth: when the map gets large, sweep expired entries before inserting so a
@@ -204,9 +216,9 @@ pub async fn resolve_youtube_id(
             let now = (state.clock)();
             cache.retain(|_, e| e.exp > now);
         }
-        cache.insert(cache_key, YtEntry { id: id.clone(), exp: (state.clock)() + ttl });
+        cache.insert(cache_key, YtEntry { ids: ids.clone(), exp: (state.clock)() + ttl });
     }
-    id
+    ids
 }
 
 pub async fn handle_meta(
@@ -222,7 +234,7 @@ pub async fn handle_meta(
     // Only imdb ids reach the upstreams (and our URLs) — reject anything else so a crafted id
     // can't be interpolated into a TMDB/KinoCheck request.
     if !is_imdb(imdb) {
-        return httputil::json(StatusCode::OK, &build_meta(ty, imdb, &base, ""), &[]);
+        return httputil::json(StatusCode::OK, &build_meta(ty, imdb, &base, &[]), &[]);
     }
     // Effective BYOK credentials: the per-install URL config wins; the server env keys are only a
     // migration fallback for legacy config-less installs (den-scout/docs/SEALED-CONFIG.md).
@@ -235,12 +247,15 @@ pub async fn handle_meta(
         .or(state.cfg.kinocheck_key.as_deref());
     let raw_lang = query_param(query, "lang").unwrap_or_else(|| "en".to_string());
     let lang = if valid_lang(&raw_lang) { raw_lang } else { "en".to_string() };
-    let yt_id = resolve_youtube_id(state, tmdb_key, kinocheck_key, imdb, ty, &lang).await;
-    // Prewarm the download UNLESS the caller opted out (?prewarm=0).
-    if !yt_id.is_empty() && query_param(query, "prewarm").as_deref() != Some("0") {
-        (state.prewarm)(state.clone(), yt_id.clone());
+    let yt_ids = resolve_youtube_ids(state, tmdb_key, kinocheck_key, imdb, ty, &lang).await;
+    // Prewarm only the primary (the one the client plays first) UNLESS the caller opted out (?prewarm=0);
+    // the alternates are downloaded on demand only if that first one fails.
+    if let Some(primary) = yt_ids.first() {
+        if query_param(query, "prewarm").as_deref() != Some("0") {
+            (state.prewarm)(state.clone(), primary.clone());
+        }
     }
-    let payload = build_meta(ty, imdb, &base, &yt_id);
+    let payload = build_meta(ty, imdb, &base, &yt_ids);
     // A SUCCESSFUL resolution (a real trailer) is cacheable 7d; an empty result (no trailer /
     // geo-blocked / a transient upstream fault) is no-store so the client re-checks a miss.
     let has_link = payload["meta"]["links"].as_array().is_some_and(|a| !a.is_empty());

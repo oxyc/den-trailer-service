@@ -27,9 +27,10 @@ pub type ClockFn = Box<dyn Fn() -> u64 + Send + Sync>;
 /// One in-flight download shared across every waiter for the same id (de-dupe).
 pub type SharedDownload = Shared<BoxFuture<Result<PathBuf, PlayError>>>;
 
-/// A resolved (or negatively-cached) ytId with its expiry, in ms since epoch.
+/// Resolved (or negatively-cached) trailer ytIds — best-playable first, then unprobed alternates the
+/// client falls back to on a playback failure. Empty = "no trailer". `exp` is ms since epoch.
 pub struct YtEntry {
-    pub id: String,
+    pub ids: Vec<String>,
     pub exp: u64,
 }
 

@@ -184,7 +184,7 @@ fn pick_candidates_orders_and_dedupes() {
 
 #[test]
 fn build_meta_produces_same_host_play_url() {
-    let out = crate::addon::build_meta("movie", "tt0111161", "https://trailers.example.com/", "abc123DEF");
+    let out = crate::addon::build_meta("movie", "tt0111161", "https://trailers.example.com/", &["abc123DEF".to_string()]);
     assert_eq!(
         out["meta"]["links"][0]["trailers"],
         "https://trailers.example.com/play/abc123DEF.mp4"
@@ -237,10 +237,20 @@ async fn resolve_returns_first_playable_and_caches() {
     let fake = FakeUpstream::new(&["firstGood11"], None);
     let state = build_state(temp_dir(), Box::new(fake.clone()), always_playable(), noop_prewarm());
 
-    assert_eq!(crate::addon::resolve_youtube_id(&state, "test-key", None, "tt0111161", "movie", "en").await, "firstGood11");
+    assert_eq!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.first().map(String::as_str), Some("firstGood11"));
     let after = fake.calls();
-    assert_eq!(crate::addon::resolve_youtube_id(&state, "test-key", None, "tt0111161", "movie", "en").await, "firstGood11");
+    assert_eq!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.first().map(String::as_str), Some("firstGood11"));
     assert_eq!(fake.calls(), after, "second lookup is a cache hit (no new upstream calls)");
+}
+
+#[tokio::test]
+async fn resolve_returns_alternates_after_the_primary_for_fallback() {
+    // Best-playable pick first, then the other candidates as unprobed fallbacks (#5 — the client tries
+    // the next one on a playback failure). No extra probing beyond first_playable.
+    let fake = FakeUpstream::new(&["playable1", "playable2"], None);
+    let state = build_state(temp_dir(), Box::new(fake), always_playable(), noop_prewarm());
+    let ids = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await;
+    assert_eq!(ids, vec!["playable1".to_string(), "playable2".to_string()]);
 }
 
 #[tokio::test]
@@ -253,7 +263,7 @@ async fn resolve_skips_geoblocked_and_falls_back() {
         })
     });
     let state = build_state(temp_dir(), Box::new(fake), prober, noop_prewarm());
-    assert_eq!(crate::addon::resolve_youtube_id(&state, "test-key", None, "tt0111161", "movie", "en").await, "worldwide22");
+    assert_eq!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.first().map(String::as_str), Some("worldwide22"));
 }
 
 #[tokio::test]
@@ -261,7 +271,7 @@ async fn resolve_returns_empty_when_none_playable() {
     let fake = FakeUpstream::new(&["blockedUS01"], None);
     let prober: ProbeFn = Box::new(|_id| Box::pin(async { crate::ytdlp::Probe::Unplayable }));
     let state = build_state(temp_dir(), Box::new(fake), prober, noop_prewarm());
-    assert_eq!(crate::addon::resolve_youtube_id(&state, "test-key", None, "tt0111161", "movie", "en").await, "");
+    assert_eq!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await, Vec::<String>::new());
 }
 
 #[tokio::test]
@@ -278,8 +288,8 @@ async fn resolve_falls_back_to_youtube_search_when_no_candidates() {
     let searcher: crate::state::SearchFn =
         Box::new(|_q| Box::pin(async { vec!["searchMiss".into(), "searchHit01".into()] }));
     let state = build_state_full(test_cfg(temp_dir()), Box::new(fake), prober, noop_prewarm(), searcher);
-    let id = crate::addon::resolve_youtube_id(&state, "test-key", None, "tt99999999", "movie", "en").await;
-    assert_eq!(id, "searchHit01");
+    let id = crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt99999999", "movie", "en").await;
+    assert_eq!(id.first().map(String::as_str), Some("searchHit01"));
 }
 
 #[tokio::test]
@@ -290,7 +300,7 @@ async fn resolve_no_search_when_title_unknown() {
     let searcher: crate::state::SearchFn =
         Box::new(|_q| Box::pin(async { vec!["shouldNotBeUsed".into()] }));
     let state = build_state_full(test_cfg(temp_dir()), Box::new(fake), prober, noop_prewarm(), searcher);
-    assert_eq!(crate::addon::resolve_youtube_id(&state, "test-key", None, "tt0", "movie", "en").await, "");
+    assert_eq!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0", "movie", "en").await, Vec::<String>::new());
 }
 
 #[tokio::test]
@@ -303,7 +313,7 @@ async fn resolve_prefers_landscape_over_a_higher_ranked_portrait() {
         Box::pin(async move { Probe::Playable { landscape: id != "portraitTop" } })
     });
     let state = build_state(temp_dir(), Box::new(fake), prober, noop_prewarm());
-    assert_eq!(crate::addon::resolve_youtube_id(&state, "test-key", None, "tt0111161", "movie", "en").await, "landscape02");
+    assert_eq!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.first().map(String::as_str), Some("landscape02"));
 }
 
 #[tokio::test]
@@ -313,7 +323,7 @@ async fn resolve_falls_back_to_portrait_when_no_landscape_playable() {
     let fake = FakeUpstream::new(&["portraitTop", "portrait02"], None);
     let prober: ProbeFn = Box::new(|_id| Box::pin(async { Probe::Playable { landscape: false } }));
     let state = build_state(temp_dir(), Box::new(fake), prober, noop_prewarm());
-    assert_eq!(crate::addon::resolve_youtube_id(&state, "test-key", None, "tt0111161", "movie", "en").await, "portraitTop");
+    assert_eq!(crate::addon::resolve_youtube_ids(&state, "test-key", None, "tt0111161", "movie", "en").await.first().map(String::as_str), Some("portraitTop"));
 }
 
 #[test]
