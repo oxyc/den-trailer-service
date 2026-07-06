@@ -42,12 +42,14 @@ pub struct Config {
     /// skipped in favour of the next trailer).
     pub ytdlp_format: String,
     /// The `--extractor-args` value forcing YouTube's innertube **player client(s)** — `None` disables
-    /// the flag (yt-dlp's own defaults). Default `youtube:player_client=tv_embedded`: the TV-embedded
-    /// client returns clean H.264 streams with **non-signature** URLs, so it sidesteps both the
-    /// "confirm you're not a bot" BotGuard challenge AND a broken nsig/JS-runtime — the two ways a
-    /// server-side extraction fails where the default `web`/`tv` clients get DRM-wrapped or blocked
-    /// manifests. Override with `YTDLP_PLAYER_CLIENTS` (comma-separated, e.g. `tv_embedded,web`), or
-    /// set it empty to fall back to yt-dlp's defaults.
+    /// the flag (yt-dlp's own defaults). Default `youtube:player_client=tv_embedded,android`: yt-dlp
+    /// queries both clients and merges their formats, so the format selector still prefers
+    /// `tv_embedded`'s clean H.264 **non-signature** URLs (which sidestep the BotGuard "confirm you're
+    /// not a bot" challenge AND a broken nsig/JS-runtime) whenever that client can serve the video —
+    /// but falls back to `android` for the videos `tv_embedded` alone reports as "not available"
+    /// (some trailers only expose formats to the android client). Without the fallback those trailers
+    /// 502 on every candidate. Override with `YTDLP_PLAYER_CLIENTS` (comma-separated), or set it empty
+    /// to fall back to yt-dlp's defaults.
     pub ytdlp_extractor_args: Option<String>,
     // Upstream bases are fields (not constants) so tests can point them at a local mock.
     pub tmdb_base: String,
@@ -77,10 +79,11 @@ impl Config {
              b[height<={h}][vcodec^=avc1][acodec^=mp4a]/18/b[ext=mp4]",
             h = max_height
         );
-        // Default to the tv_embedded client (BotGuard/nsig-resistant, clean avc1); empty env disables.
+        // tv_embedded first (BotGuard/nsig-resistant, clean avc1) with android as fallback for the
+        // videos tv_embedded reports "not available"; yt-dlp merges both clients' formats. Empty disables.
         let ytdlp_extractor_args = env::var("YTDLP_PLAYER_CLIENTS")
             .map(|v| v.trim().to_string())
-            .unwrap_or_else(|_| "tv_embedded".to_string());
+            .unwrap_or_else(|_| "tv_embedded,android".to_string());
         let ytdlp_extractor_args = if ytdlp_extractor_args.is_empty() {
             None
         } else {
