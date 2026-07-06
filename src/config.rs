@@ -1,6 +1,6 @@
 //! Runtime configuration, all from the environment (same knobs as the Node service).
 //!
-//! Env: PORT, CACHE_DIR, YTDLP_PATH, MAX_HEIGHT, CACHE_MAX_BYTES (playback);
+//! Env: PORT, CACHE_DIR, YTDLP_PATH, MAX_HEIGHT, CACHE_MAX_BYTES, YTDLP_PLAYER_CLIENTS (playback);
 //!      PUBLIC_BASE_URL (optional); REEL_CONFIG_KEY / REEL_CONFIG_KEYS_PREV (sealed config-in-URL).
 //!      TMDB_KEY / KINOCHECK_KEY are the legacy server-side discovery keys — now a MIGRATION FALLBACK
 //!      used only when a request carries no per-install config; new installs carry a BYOK TMDB key
@@ -41,6 +41,14 @@ pub struct Config {
     /// playback needs (a candidate that can't produce it — geo-blocked, removed, VP9/AV1-only — is
     /// skipped in favour of the next trailer).
     pub ytdlp_format: String,
+    /// The `--extractor-args` value forcing YouTube's innertube **player client(s)** — `None` disables
+    /// the flag (yt-dlp's own defaults). Default `youtube:player_client=tv_embedded`: the TV-embedded
+    /// client returns clean H.264 streams with **non-signature** URLs, so it sidesteps both the
+    /// "confirm you're not a bot" BotGuard challenge AND a broken nsig/JS-runtime — the two ways a
+    /// server-side extraction fails where the default `web`/`tv` clients get DRM-wrapped or blocked
+    /// manifests. Override with `YTDLP_PLAYER_CLIENTS` (comma-separated, e.g. `tv_embedded,web`), or
+    /// set it empty to fall back to yt-dlp's defaults.
+    pub ytdlp_extractor_args: Option<String>,
     // Upstream bases are fields (not constants) so tests can point them at a local mock.
     pub tmdb_base: String,
     pub kinocheck_base: String,
@@ -69,6 +77,15 @@ impl Config {
              b[height<={h}][vcodec^=avc1][acodec^=mp4a]/18/b[ext=mp4]",
             h = max_height
         );
+        // Default to the tv_embedded client (BotGuard/nsig-resistant, clean avc1); empty env disables.
+        let ytdlp_extractor_args = env::var("YTDLP_PLAYER_CLIENTS")
+            .map(|v| v.trim().to_string())
+            .unwrap_or_else(|_| "tv_embedded".to_string());
+        let ytdlp_extractor_args = if ytdlp_extractor_args.is_empty() {
+            None
+        } else {
+            Some(format!("youtube:player_client={ytdlp_extractor_args}"))
+        };
         Config {
             port,
             cache_dir,
@@ -85,6 +102,7 @@ impl Config {
             config_keys_prev: env_opt("REEL_CONFIG_KEYS_PREV").unwrap_or_default(),
             public_base_url: env_opt("PUBLIC_BASE_URL"),
             ytdlp_format,
+            ytdlp_extractor_args,
             tmdb_base: "https://api.themoviedb.org/3".to_string(),
             kinocheck_base: "https://api.kinocheck.com".to_string(),
         }

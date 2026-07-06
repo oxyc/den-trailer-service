@@ -89,6 +89,7 @@ fn test_cfg(cache_dir: PathBuf) -> Config {
         config_keys_prev: String::new(),
         public_base_url: None,
         ytdlp_format: "fmt".into(),
+        ytdlp_extractor_args: Some("youtube:player_client=tv_embedded".into()),
         tmdb_base: "http://unused".into(),
         kinocheck_base: "http://unused".into(),
     }
@@ -139,6 +140,7 @@ fn build_state_full(
         clock: Box::new(default_clock),
         download_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::DOWNLOAD_CONCURRENCY)),
         probe_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(crate::PROBE_CONCURRENCY)),
+        extract_fails: std::sync::atomic::AtomicU32::new(0),
     })
 }
 
@@ -212,22 +214,29 @@ fn classify_defaults_to_502() {
 fn health_reports_degraded_and_ok_states() {
     // No TMDB key AND no sealed-config keyring → trailers can't work → degraded.
     assert_eq!(
-        crate::health_body(false, 0),
+        crate::health_body(false, 0, 0),
         json!({"status": "degraded", "reason": "tmdb_key_missing", "detail": "set REEL_CONFIG_KEY (per-install BYOK) or TMDB_KEY"})
     );
-    // A missing key wins even if upstreams are also failing.
-    assert_eq!(crate::health_body(false, 99)["reason"], "tmdb_key_missing");
+    // A missing key wins even if upstreams / the extractor are also failing.
+    assert_eq!(crate::health_body(false, 99, 99)["reason"], "tmdb_key_missing");
 
-    // Key present but upstreams have been failing (>= threshold) → degraded.
+    // Key present but upstreams have been failing (>= threshold) → degraded (wins over the extractor).
     assert_eq!(
-        crate::health_body(true, 3),
+        crate::health_body(true, 3, 99),
         json!({"status": "degraded", "reason": "upstream_unavailable", "detail": "TMDB/KinoCheck have been failing"})
     );
-    assert_eq!(crate::health_body(true, 4)["reason"], "upstream_unavailable");
+    assert_eq!(crate::health_body(true, 4, 0)["reason"], "upstream_unavailable");
 
-    // Key present, failures below the threshold → ok.
-    assert_eq!(crate::health_body(true, 0), json!({"status": "ok"}));
-    assert_eq!(crate::health_body(true, 2), json!({"status": "ok"}));
+    // Upstreams fine but yt-dlp can't extract anything (>= threshold) → degraded (the silent-outage gap).
+    assert_eq!(
+        crate::health_body(true, 0, 3)["reason"],
+        json!("extractor_unavailable")
+    );
+    assert_eq!(crate::health_body(true, 0, 2), json!({"status": "ok"})); // below threshold → ok
+
+    // Key present, everything below the threshold → ok.
+    assert_eq!(crate::health_body(true, 0, 0), json!({"status": "ok"}));
+    assert_eq!(crate::health_body(true, 2, 2), json!({"status": "ok"}));
 }
 
 // --- resolve logic ----------------------------------------------------------

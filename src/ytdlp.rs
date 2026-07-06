@@ -82,6 +82,16 @@ fn watch_url(vid: &str) -> String {
     format!("https://www.youtube.com/watch?v={vid}")
 }
 
+/// Append the configured YouTube `--extractor-args` (the player-client override) to a yt-dlp command
+/// when one is set. Applied to every command that actually extracts a video (probe + download) so the
+/// probe validates exactly what playback fetches. yt-dlp accepts options after the URL, so this can be
+/// appended to an already-built command.
+fn apply_extractor_args(cmd: &mut Command, cfg: &Config) {
+    if let Some(ea) = &cfg.ytdlp_extractor_args {
+        cmd.args(["--extractor-args", ea]);
+    }
+}
+
 /// Does yt-dlp think this id is extractable HERE (right region, decodable formats)? Fast:
 /// Outcome of probing a candidate without downloading: whether yt-dlp can extract it here, and (when
 /// known) whether it's landscape. So the resolver can prefer a landscape trailer over a portrait one —
@@ -117,6 +127,7 @@ pub async fn probe(cfg: &Config, vid: &str) -> Probe {
     .stdout(Stdio::piped())
     .stderr(Stdio::piped()) // capture, never swallow — a silent probe error hid a total-outage regression
     .kill_on_drop(true); // cancelled/timed-out probe kills its yt-dlp too
+    apply_extractor_args(&mut cmd, cfg);
     // Timeout backstop: on elapse the output future is dropped → kill_on_drop reaps.
     match tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), cmd.output()).await {
         Ok(Ok(o)) if o.status.success() => {
@@ -168,6 +179,7 @@ async fn probe_extractable(cfg: &Config, vid: &str) -> bool {
     .stdout(Stdio::null())
     .stderr(Stdio::null())
     .kill_on_drop(true);
+    apply_extractor_args(&mut cmd, cfg);
     matches!(
         tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), cmd.status()).await,
         Ok(Ok(s)) if s.success()
@@ -240,35 +252,35 @@ pub async fn download_to(cfg: &Config, vid: &str, tmp: &Path) -> Result<(), Play
     let cache = cfg.ytdlp_cache.to_string_lossy().into_owned();
     let tmp_s = tmp.to_string_lossy().into_owned();
     let work = async {
-        let mut child = Command::new(&cfg.ytdlp)
-            .args([
-                "-q",
-                "--no-playlist",
-                "--no-warnings",
-                "--socket-timeout",
-                "15", // yt-dlp aborts stalled sockets itself; the outer timeout is a backstop
-                "--cache-dir",
-                &cache, // reuse the nsig/player-JS work the probe already did
-                "-N",
-                "4", // parallel DASH fragments → faster download
-                // AVPlayer hardware-decodable: H.264 (avc1) + AAC (mp4a) — same string the probe validates.
-                "-f",
-                &cfg.ytdlp_format,
-                "--merge-output-format",
-                "mp4",
-                // faststart during the merge's ffmpeg (one pass), not a separate whole-file rewrite.
-                "--postprocessor-args",
-                "Merger+ffmpeg:-movflags +faststart",
-                "-o",
-                &tmp_s,
-                &watch_url(vid),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true) // don't leave an orphaned yt-dlp/ffmpeg if the task is dropped
-            .spawn()
-            .map_err(PlayError::spawn)?;
+        let mut cmd = Command::new(&cfg.ytdlp);
+        cmd.args([
+            "-q",
+            "--no-playlist",
+            "--no-warnings",
+            "--socket-timeout",
+            "15", // yt-dlp aborts stalled sockets itself; the outer timeout is a backstop
+            "--cache-dir",
+            &cache, // reuse the nsig/player-JS work the probe already did
+            "-N",
+            "4", // parallel DASH fragments → faster download
+            // AVPlayer hardware-decodable: H.264 (avc1) + AAC (mp4a) — same string the probe validates.
+            "-f",
+            &cfg.ytdlp_format,
+            "--merge-output-format",
+            "mp4",
+            // faststart during the merge's ffmpeg (one pass), not a separate whole-file rewrite.
+            "--postprocessor-args",
+            "Merger+ffmpeg:-movflags +faststart",
+            "-o",
+            &tmp_s,
+            &watch_url(vid),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true); // don't leave an orphaned yt-dlp/ffmpeg if the task is dropped
+        apply_extractor_args(&mut cmd, cfg); // same player-client override the probe validated with
+        let mut child = cmd.spawn().map_err(PlayError::spawn)?;
 
         // Drain stderr concurrently with wait() so a chatty yt-dlp can't deadlock on a full pipe.
         let mut stderr_pipe = child.stderr.take().expect("stderr piped");

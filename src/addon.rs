@@ -199,13 +199,19 @@ pub async fn resolve_youtube_ids(
         out.truncate(MAX_PROBE);
         out
     };
-    // Surface the "no trailer" causes so an outage isn't a silent empty (never swallow).
+    // Surface the "no trailer" causes so an outage isn't a silent empty (never swallow), and track the
+    // systemic-extraction signal for /health: a resolve that had real candidates but extracted nothing
+    // bumps the counter; any playable result clears it. "No candidates" is a title with no trailer, not
+    // an extraction failure, so it leaves the counter untouched.
     if ids.is_empty() {
         if candidates.is_empty() {
             eprintln!("trailer {imdb} ({ty}/{lang}): no TMDB/KinoCheck candidates + search found nothing playable");
         } else {
+            state.extract_fails.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             eprintln!("trailer {imdb} ({ty}/{lang}): {} candidate(s) + search, none playable here", candidates.len());
         }
+    } else {
+        state.extract_fails.store(0, std::sync::atomic::Ordering::Relaxed);
     }
     let ttl = if ids.is_empty() { YT_NEG_TTL_MS } else { YT_TTL_MS };
     {

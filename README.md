@@ -41,7 +41,7 @@ GET /manifest.json                       →  addon manifest (add this URL to De
 GET /meta/<movie|series>/<imdbId>.json    →  { meta: { links: [ { trailers: <play url> } ] } }
 GET /play/<youtube_id>.mp4  (or ?v=…)     →  200/206 video/mp4  (range-enabled, seekable)
 GET /crop/<youtube_id>.json               →  detected content rectangle (letterbox trim hint)
-GET /health                               →  200 ok
+GET /health                               →  200 {status} — ok, or degraded (see below)
 ```
 
 Resolving a trailer at `/meta` also **prewarms** its download in the background, so the
@@ -131,8 +131,16 @@ Tests: `cargo test` (hermetic — a fake upstream + stubbed prober, no network, 
 | `CLAP` | `1` | set `0` to disable baking the `clap` letterbox-crop box |
 | `MAX_HEIGHT` | `1080` | avc1 caps at 1080p on YouTube |
 | `CACHE_MAX_BYTES` | `8589934592` (8 GB) | LRU eviction threshold |
+| `YTDLP_PLAYER_CLIENTS` | `tv_embedded` | YouTube innertube client(s) for `--extractor-args player_client`. The TV-embedded client returns clean H.264 with non-signature URLs, so it sidesteps BotGuard ("confirm you're not a bot") **and** a broken nsig/JS-runtime — the two ways server-side extraction fails while the `web`/`tv` clients get DRM-wrapped/blocked. Comma-separate to try several (put `tv_embedded` **last** so its clean formats win ties); empty = yt-dlp defaults. |
 
 ## Maintenance
+
+`/health` always returns 200 (liveness) with a JSON `status`: `ok`, or `degraded` with a `reason` —
+`tmdb_key_missing` (no discovery key), `upstream_unavailable` (TMDB/KinoCheck failing), or
+`extractor_unavailable` (trailers resolve upstream but yt-dlp can't extract **any** of them here —
+YouTube BotGuard / a stale yt-dlp / broken nsig-JS; bump `YTDLP_VERSION` or tune `YTDLP_PLAYER_CLIENTS`).
+The `extractor_unavailable` signal exists because that outage is otherwise invisible — upstreams keep
+answering while every trailer silently comes back empty.
 
 YouTube changes frequently. Keep yt-dlp current — bump `YTDLP_VERSION` in the `Dockerfile`
 when extraction starts failing. The image also bundles **deno** (`DENO_VERSION`): recent

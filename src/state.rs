@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -59,6 +59,12 @@ pub struct AppState {
     /// box: downloads (yt-dlp+ffmpeg) and probes (yt-dlp --simulate).
     pub download_sem: Arc<Semaphore>,
     pub probe_sem: Arc<Semaphore>,
+    /// Consecutive resolves that had real trailer candidates but yt-dlp could extract **none** of them
+    /// — the signature of a systemic extraction outage (YouTube BotGuard / a broken nsig-JS runtime),
+    /// which is otherwise invisible to /health (upstream TMDB/KinoCheck still answer fine). Reset to 0
+    /// on any resolve that DOES yield a playable trailer, so only a real run of failures accumulates.
+    /// Surfaced as `degraded: extractor_unavailable` past the threshold (ADDON-02).
+    pub extract_fails: AtomicU32,
 }
 
 impl AppState {
@@ -94,6 +100,7 @@ impl AppState {
             clock: Box::new(default_clock),
             download_sem: Arc::new(Semaphore::new(crate::DOWNLOAD_CONCURRENCY)),
             probe_sem,
+            extract_fails: AtomicU32::new(0),
         })
     }
 }
