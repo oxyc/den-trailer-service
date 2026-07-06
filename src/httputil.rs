@@ -4,7 +4,7 @@
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::header::{HeaderMap, HeaderValue, CACHE_CONTROL, ETAG, IF_NONE_MATCH};
+use hyper::header::{HeaderMap, HeaderValue, ACCEPT_RANGES, CACHE_CONTROL, ETAG, IF_NONE_MATCH, RANGE};
 use hyper::{Method, Response, StatusCode};
 
 /// The one body type every handler returns: bytes in, `io::Error` out (streamed file bodies can
@@ -113,14 +113,23 @@ pub fn apply_conditional(
     if !matches!(*method, Method::GET | Method::HEAD) {
         return resp;
     }
+    // Never collapse a range-able resource (e.g. the `/play` video, which advertises `Accept-Ranges`),
+    // a partial/non-200, or a `Range` request to a bare `304`: a range request must get its bytes, not
+    // an empty body — a 304 there silently breaks player seeks. Such responses still get HEAD-stripped.
+    if resp.status() != StatusCode::OK
+        || resp.headers().contains_key(ACCEPT_RANGES)
+        || req_headers.contains_key(RANGE)
+    {
+        return head_stripped(method, resp);
+    }
     let Some(etag) = resp.headers().get(ETAG) else {
-        return resp;
+        return head_stripped(method, resp);
     };
     let matched = req_headers
         .get(IF_NONE_MATCH)
         .is_some_and(|inm| if_none_match_matches(inm, etag));
     if !matched {
-        return resp;
+        return head_stripped(method, resp);
     }
     let mut b = Response::builder().status(StatusCode::NOT_MODIFIED);
     let headers = b.headers_mut().expect("fresh builder has headers");
@@ -131,6 +140,16 @@ pub fn apply_conditional(
         headers.insert(CACHE_CONTROL, v.clone());
     }
     b.body(full("")).unwrap()
+}
+
+/// A HEAD response must not carry a body (RFC 9110 §9.3.2) — drop it while keeping every header
+/// (including the `Content-Length` a GET would have returned). A no-op for GET.
+fn head_stripped(method: &Method, resp: Response<Body>) -> Response<Body> {
+    if *method == Method::HEAD {
+        let (parts, _body) = resp.into_parts();
+        return Response::from_parts(parts, full(""));
+    }
+    resp
 }
 
 /// RFC 9110 `If-None-Match`: `*` matches anything; otherwise any entry in the comma-separated list
