@@ -48,12 +48,12 @@ RUN set -eux; \
 # Pinned yt-dlp STANDALONE binary (PyInstaller onefile — bundles Python, so no system python3
 # needed). Bump YTDLP_VERSION to update (YouTube changes often — that's the whole maintenance
 # burden, and it's yt-dlp's, not ours).
-ARG YTDLP_VERSION=2026.06.09
+ARG YTDLP_VERSION=2026.07.04
 # SHA256 of each release asset, from the release's SHA2-256SUMS. Verifying the download is the
 # supply-chain guard — there's no advisory DB for a standalone binary, so integrity is the whole game.
 # Kept in lockstep with YTDLP_VERSION by .github/workflows/ytdlp-update.yml (which refreshes both).
-ARG YTDLP_SHA256_AMD64=bf8aac79b72287a6d2043074415132558b43743a8f9461a22b0141e90f16ce66
-ARG YTDLP_SHA256_ARM64=cabd246445bdfde0eda0dfe68bbe90354be83f3fdbbf077df11a2ea55f41cdbd
+ARG YTDLP_SHA256_AMD64=6bbb3d314cde4febe36e5fa1d55462e29c974f63444e707871834f6d8cc210ae
+ARG YTDLP_SHA256_ARM64=b6ce97646773070d7a7ffd6bbbdcaecb47c48483909c54c915bf08a7a9b5e0b1
 RUN set -eux; \
     case "$TARGETARCH" in \
       amd64) asset=yt-dlp_linux; sha=$YTDLP_SHA256_AMD64 ;; \
